@@ -186,18 +186,22 @@ export const connectionQualityVariants: Variants = {
   excellent: {
     backgroundColor: "rgb(34, 197, 94)",
     width: "100%",
+    transition: { type: "spring", stiffness: 120, damping: 20 },
   },
   good: {
     backgroundColor: "rgb(134, 239, 172)",
     width: "75%",
+    transition: { type: "spring", stiffness: 120, damping: 20 },
   },
   fair: {
     backgroundColor: "rgb(250, 204, 21)",
     width: "50%",
+    transition: { type: "spring", stiffness: 100, damping: 18 },
   },
   poor: {
     backgroundColor: "rgb(239, 68, 68)",
     width: "25%",
+    transition: { type: "spring", stiffness: 80, damping: 15 },
   },
 };
 
@@ -351,6 +355,68 @@ export const focusRingVariants: Variants = {
       duration: 0.2,
       ease: "easeOut",
     },
+  },
+};
+
+// Status change flash — brief highlight when status transitions
+export const statusChangeFlashVariants: Variants = {
+  idle: { opacity: 0, scale: 1 },
+  flash: {
+    opacity: [0, 0.4, 0],
+    scale: [1, 1.08, 1],
+    transition: {
+      duration: 0.5,
+      ease: "easeOut",
+    },
+  },
+};
+
+// Offline alert — draws attention with a gentle shake
+export const offlineAlertVariants: Variants = {
+  idle: { x: 0 },
+  shake: {
+    x: [0, -6, 6, -4, 4, -2, 2, 0],
+    transition: {
+      duration: 0.5,
+      ease: "easeInOut",
+    },
+  },
+};
+
+// Monitoring pulse — indicates active background monitoring
+export const monitoringPulseVariants: Variants = {
+  active: {
+    scale: [1, 1.4, 1],
+    opacity: [0.6, 0, 0.6],
+    transition: {
+      duration: 2.5,
+      repeat: Infinity,
+      ease: "easeOut",
+    },
+  },
+  inactive: {
+    scale: 1,
+    opacity: 0,
+    transition: { duration: 0.3 },
+  },
+};
+
+// Latency bar — fills proportionally with spring physics
+export const latencyBarVariants: Variants = {
+  good: {
+    scaleX: 0.25,
+    backgroundColor: "rgb(34, 197, 94)",
+    transition: { type: "spring", stiffness: 120, damping: 20 },
+  },
+  warning: {
+    scaleX: 0.55,
+    backgroundColor: "rgb(250, 204, 21)",
+    transition: { type: "spring", stiffness: 100, damping: 18 },
+  },
+  bad: {
+    scaleX: 1,
+    backgroundColor: "rgb(239, 68, 68)",
+    transition: { type: "spring", stiffness: 80, damping: 15 },
   },
 };
 
