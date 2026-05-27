@@ -3,6 +3,7 @@
 import React, { useState, useCallback } from "react";
 import { motion, AnimatePresence, type Variants } from "framer-motion";
 import { useTranslations } from "next-intl";
+import { useOptimisticUpdate } from "@/hooks/useOptimisticUpdate";
 
 /**
  * Form data interface for KYC submission
@@ -98,9 +99,23 @@ export const KYCSubmissionForm: React.FC<KYCSubmissionFormProps> = ({
     documentUpload: null,
   });
   const [errors, setErrors] = useState<Partial<KYCFormData>>({});
-  const [isSubmitting, setIsSubmitting] = useState(false);
-  const [submitStatus, setSubmitStatus] = useState<"idle" | "loading" | "success" | "error">("idle");
   const [announcementText, setAnnouncementText] = useState("");
+
+  const {
+    state: kycState,
+    isPending,
+    executeUpdate,
+  } = useOptimisticUpdate<{ submitted: boolean; data: KYCFormData | null }>(
+    { submitted: false, data: null },
+    {
+      onSuccess: () => {
+        setAnnouncementText(t("kyc.submitSuccess") || "KYC form submitted successfully!");
+      },
+      onError: () => {
+        setAnnouncementText(t("kyc.submitError") || "Failed to submit KYC form. Please try again.");
+      },
+    }
+  );
 
   /**
    * Validate form data
@@ -147,21 +162,13 @@ export const KYCSubmissionForm: React.FC<KYCSubmissionFormProps> = ({
       return;
     }
 
-    setIsSubmitting(true);
-    setSubmitStatus("loading");
     setAnnouncementText(t("kyc.submitting") || "Submitting KYC form...");
 
-    try {
-      await onSubmit?.(formData);
-      setSubmitStatus("success");
-      setAnnouncementText(t("kyc.submitSuccess") || "KYC form submitted successfully!");
-    } catch (error) {
-      setSubmitStatus("error");
-      setAnnouncementText(t("kyc.submitError") || "Failed to submit KYC form. Please try again.");
-    } finally {
-      setIsSubmitting(false);
-    }
-  }, [formData, validateForm, onSubmit, t]);
+    await executeUpdate(
+      () => ({ submitted: true, data: formData }),
+      async () => { await onSubmit?.(formData); }
+    );
+  }, [formData, validateForm, onSubmit, t, executeUpdate]);
 
   /**
    * Handle input changes
@@ -488,7 +495,7 @@ export const KYCSubmissionForm: React.FC<KYCSubmissionFormProps> = ({
             className="flex-1 rounded-xl border border-pluto-200 bg-white px-6 py-3 font-semibold text-pluto-900 transition-all hover:bg-pluto-50 focus:ring-2 focus:ring-pluto-400"
             variants={submitVariants}
             animate="idle"
-            disabled={isSubmitting}
+            disabled={isPending}
           >
             {t("common.cancel") || "Cancel"}
           </motion.button>
@@ -496,20 +503,20 @@ export const KYCSubmissionForm: React.FC<KYCSubmissionFormProps> = ({
             type="submit"
             className="flex-1 rounded-xl bg-pluto-600 px-6 py-3 font-semibold text-white transition-all hover:bg-pluto-700 focus:ring-2 focus:ring-pluto-400 disabled:opacity-50 disabled:cursor-not-allowed"
             variants={submitVariants}
-            animate={submitStatus}
-            disabled={isSubmitting}
+            animate={kycState.submitted ? (isPending ? "loading" : "success") : "idle"}
+            disabled={isPending || kycState.submitted}
             aria-describedby="submit-status"
           >
-            {isSubmitting ? (
+            {isPending && kycState.submitted ? (
               <span className="flex items-center justify-center gap-2">
                 <motion.div
                   className="h-4 w-4 rounded-full border-2 border-white border-t-transparent"
                   animate={{ rotate: 360 }}
                   transition={{ duration: 1, repeat: Infinity, ease: "linear" }}
                 />
-                {t("kyc.submitting") || "Submitting..."}
+                {t("kyc.confirming") || "Confirming..."}
               </span>
-            ) : submitStatus === "success" ? (
+            ) : kycState.submitted ? (
               t("kyc.submitted") || "Submitted!"
             ) : (
               t("kyc.submit") || "Submit KYC"
@@ -519,9 +526,8 @@ export const KYCSubmissionForm: React.FC<KYCSubmissionFormProps> = ({
 
         {/* Submit status for screen readers */}
         <div id="submit-status" className="sr-only">
-          {submitStatus === "loading" && (t("kyc.submitting") || "Submitting form...")}
-          {submitStatus === "success" && (t("kyc.submitSuccess") || "Form submitted successfully")}
-          {submitStatus === "error" && (t("kyc.submitError") || "Form submission failed")}
+          {isPending && kycState.submitted && (t("kyc.confirming") || "Confirming submission...")}
+          {!isPending && kycState.submitted && (t("kyc.submitSuccess") || "Form submitted successfully")}
         </div>
       </motion.form>
     </div>
