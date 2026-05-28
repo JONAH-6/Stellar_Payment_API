@@ -129,6 +129,20 @@ export function useBalanceSync(
     }
   }, [merchantId, apiKey, enabled, onUpdate, address, horizonUrl]);
 
+  /**
+   * Optimistically set a balance locally so the UI reflects a just-submitted
+   * change immediately; the next poll reconciles it with the authoritative value.
+   */
+  const applyOptimistic = useCallback((code: string, balance: string) => {
+    setBalances((prev) => {
+      const index = prev.findIndex((b) => b.code === code);
+      if (index === -1) return [...prev, { code, balance }];
+      const next = [...prev];
+      next[index] = { ...next[index], balance };
+      return next;
+    });
+  }, []);
+
   useEffect(() => {
     fetchBalances();
 
@@ -149,6 +163,7 @@ export function useBalanceSync(
     lastUpdated,
     error,
     refresh: fetchBalances,
+    applyOptimistic,
     isStale: lastUpdated ? Date.now() - lastUpdated.getTime() > pollingInterval * 2 : true,
   };
 }

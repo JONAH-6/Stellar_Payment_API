@@ -47,4 +47,66 @@ describe("useBalanceSync", () => {
 
     expect(global.fetch).toHaveBeenCalledTimes(2);
   });
+
+  it("fetches from Horizon and normalises balances when an address is given", async () => {
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        balances: [
+          { asset_type: "native", balance: "42.5" },
+          { asset_type: "credit_alphanum4", asset_code: "USDC", balance: "10" },
+        ],
+      }),
+    });
+
+    const { result } = renderHook(() =>
+      useBalanceSync(null, null, { address: "GABC", pollingInterval: 0 })
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(global.fetch).toHaveBeenCalledWith(
+      expect.stringContaining("/accounts/GABC"),
+      expect.any(Object)
+    );
+    expect(result.current.balances).toEqual([
+      { code: "XLM", balance: "42.5" },
+      { code: "USDC", balance: "10" },
+    ]);
+    expect(result.current.lastUpdated).not.toBeNull();
+  });
+
+  it("does not fetch when disabled", () => {
+    global.fetch = vi.fn();
+    renderHook(() => useBalanceSync("m1", "k1", { enabled: false }));
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("applies an optimistic balance immediately without a network call", () => {
+    global.fetch = vi.fn();
+    const { result } = renderHook(() =>
+      useBalanceSync(null, null, { enabled: false })
+    );
+
+    act(() => {
+      result.current.applyOptimistic("XLM", "7.5");
+    });
+    expect(result.current.balances).toEqual([{ code: "XLM", balance: "7.5" }]);
+
+    act(() => {
+      result.current.applyOptimistic("XLM", "9");
+    });
+    expect(result.current.balances).toEqual([{ code: "XLM", balance: "9" }]);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("reports the balance as stale until the first successful sync", () => {
+    global.fetch = vi.fn();
+    const { result } = renderHook(() =>
+      useBalanceSync("m1", "k1", { enabled: false, pollingInterval: 1000 })
+    );
+    expect(result.current.isStale).toBe(true);
+  });
 });

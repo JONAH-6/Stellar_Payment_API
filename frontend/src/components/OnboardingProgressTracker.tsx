@@ -3,6 +3,7 @@
 import React, { useCallback, useMemo, useEffect, useReducer, useRef } from "react";
 import { motion, AnimatePresence, useReducedMotion, type Variants } from "framer-motion";
 import { useTranslations } from "next-intl";
+import { onboardingReducer, createInitialOnboardingState } from "./onboarding-reducer";
 
 /**
  * Step interface for onboarding progress
@@ -27,48 +28,6 @@ interface OnboardingProgressTrackerProps {
   showStepNumbers?: boolean;
   orientation?: "vertical" | "horizontal";
   compact?: boolean;
-}
-
-/**
- * State for onboarding tracker — supports optimistic updates with rollback
- */
-interface OnboardingState {
-  currentStep: string | undefined;
-  /** Optimistic step id set immediately on click before server confirms */
-  optimisticStep: string | undefined;
-  announcementText: string;
-  /** Whether an optimistic update is pending server confirmation */
-  isPending: boolean;
-}
-
-/**
- * Actions for onboarding state
- */
-type OnboardingAction =
-  | { type: "SET_CURRENT_STEP"; payload: string }
-  | { type: "OPTIMISTIC_STEP"; payload: string }
-  | { type: "CONFIRM_STEP"; payload: string }
-  | { type: "ROLLBACK_STEP" }
-  | { type: "SET_ANNOUNCEMENT"; payload: string };
-
-/**
- * Reducer for onboarding state — handles optimistic updates and rollback
- */
-function onboardingReducer(state: OnboardingState, action: OnboardingAction): OnboardingState {
-  switch (action.type) {
-    case "SET_CURRENT_STEP":
-      return { ...state, currentStep: action.payload, optimisticStep: undefined, isPending: false };
-    case "OPTIMISTIC_STEP":
-      return { ...state, optimisticStep: action.payload, isPending: true };
-    case "CONFIRM_STEP":
-      return { ...state, currentStep: action.payload, optimisticStep: undefined, isPending: false };
-    case "ROLLBACK_STEP":
-      return { ...state, optimisticStep: undefined, isPending: false };
-    case "SET_ANNOUNCEMENT":
-      return { ...state, announcementText: action.payload };
-    default:
-      return state;
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,12 +157,10 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
   // Respect user's OS-level "reduce motion" preference — #809
   const prefersReducedMotion = useReducedMotion();
 
-  const [state, dispatch] = useReducer(onboardingReducer, {
-    currentStep: currentStepProp || steps[0]?.id,
-    optimisticStep: undefined,
-    announcementText: "",
-    isPending: false,
-  });
+  const [state, dispatch] = useReducer(
+    onboardingReducer,
+    createInitialOnboardingState(currentStepProp || steps[0]?.id),
+  );
 
   // Track previous step for rollback — #812
   const previousStepRef = useRef<string | undefined>(state.currentStep);

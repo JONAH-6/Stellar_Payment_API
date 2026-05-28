@@ -39,7 +39,17 @@ export function SupportPanel() {
 
   const selectedBalance = (balances as any).find((b: any) => b.code === assetCode)?.balance ?? "0";
   const isUnfunded = visitorAddress && balances.length === 0 && !loadingBalance;
-  
+
+  // Single authoritative screen-reader announcement for real-time balance sync,
+  // so updates are spoken as one clear message instead of raw visual swaps.
+  const balanceAnnouncement = !visitorAddress
+    ? ""
+    : loadingBalance
+      ? "Syncing wallet balance…"
+      : isUnfunded
+        ? "Wallet is unfunded."
+        : `Balance synced: ${selectedBalance} ${assetCode}.`;
+
   const handleAmountChange = (val: string) => {
     setAmount(val);
   };
@@ -95,6 +105,11 @@ export function SupportPanel() {
 
   return (
     <div className="flex flex-col gap-5 p-1">
+      {/* Authoritative live region for real-time balance-sync announcements */}
+      <div className="sr-only" role="status" aria-live="polite" aria-atomic="true">
+        {balanceAnnouncement}
+      </div>
+
       <div className="space-y-4">
         {/* Wallet Info */}
         <div className="flex items-center justify-between text-[11px] font-mono uppercase tracking-wider">
@@ -153,6 +168,27 @@ export function SupportPanel() {
                   </motion.span>
                 )}
               </AnimatePresence>
+            {/* Visual-only — announcements are handled by the live region above. */}
+            <div className="text-[10px] text-slate-400">
+              {loadingBalance ? (
+                <div className="flex items-center gap-2">
+                  <span className="sr-only">Loading balance...</span>
+                  <Spinner size="xs" aria-hidden="true" />
+                </div>
+              ) : isUnfunded ? (
+                <a 
+                  href="https://laboratory.stellar.org/#account-creator?network=testnet" 
+                  target="_blank" 
+                  rel="noopener noreferrer"
+                  className="text-yellow-400 hover:underline"
+                >
+                  Unfunded (Fund on Testnet)
+                </a>
+              ) : (
+                <span aria-label={`Available balance: ${selectedBalance} ${assetCode}`}>
+                  Available: {selectedBalance} {assetCode}
+                </span>
+              )}
             </div>
           </div>
           <div className="relative">
