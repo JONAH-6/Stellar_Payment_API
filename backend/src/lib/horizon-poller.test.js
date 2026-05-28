@@ -99,6 +99,7 @@ import {
   getPollerHealth,
   resetPollerState,
   pollOnce,
+  createLedgerMonitorRateLimiter,
 } from "./horizon-poller.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -149,6 +150,13 @@ describe("Ledger Monitor — error recovery (Issue #627)", () => {
     mockSendReceiptEmail.mockResolvedValue(undefined);
     mockRenderReceiptEmail.mockReturnValue("<html>receipt</html>");
     mockGetPayloadForVersion.mockReturnValue({ event: "payment.confirmed" });
+    mockVerifyTransactionSignature.mockResolvedValue({
+      valid: true,
+      reason: "ok",
+      isMultiSig: false,
+      signatureCount: 1,
+      thresholdMet: true,
+    });
   });
 
   afterEach(() => {
@@ -601,6 +609,12 @@ describe("Ledger Monitor — error recovery (Issue #627)", () => {
         limit: vi.fn().mockResolvedValue({ data: [], error: null }),
       }));
 
+      await pollOnce();
+
+      expect(mockFindMatchingPayment).not.toHaveBeenCalled();
+    });
+  });
+
   describe("merchant notification lookup", () => {
     it("continues confirmation when merchant notification config lookup fails", async () => {
       const payment = makePayment();
@@ -649,24 +663,125 @@ describe("Ledger Monitor — error recovery (Issue #627)", () => {
         transaction_hash: "tx-abc",
         received_amount: "10.0000000",
       });
-      mockVerifyTransactionSignature.mockResolvedValue({
-        valid: true,
-        reason: "ok",
-        isMultiSig: false,
-        signatureCount: 1,
-        thresholdMet: true,
-      });
 
       await pollOnce();
 
       expect(mockPaymentConfirmedCounter.inc).toHaveBeenCalledWith({ asset: payment.asset });
       expect(mockSendWebhook).not.toHaveBeenCalled();
     });
-  });
+
+    it("caches merchant notification config within one poll cycle", async () => {
+      const payments = [
+        makePayment({ id: "pay-001", recipient: "GA", merchant_id: "merchant-001" }),
+        makePayment({ id: "pay-002", recipient: "GA", merchant_id: "merchant-001" }),
+      ];
+      let paymentsCallCount = 0;
+      mockSupabaseFrom.mockImplementation((table) => {
+        if (table === "merchants") {
+          return {
+            select: vi.fn().mockReturnThis(),
+            eq: vi.fn().mockReturnThis(),
+            maybeSingle: vi.fn().mockResolvedValue({ data: makeMerchant(), error: null }),
+          };
+        }
+
+        paymentsCallCount += 1;
+        if (paymentsCallCount === 1) {
+          return {
+            select: vi.fn().mockReturnThis(),
+            eq: vi.fn().mockReturnThis(),
+            is: vi.fn().mockReturnThis(),
+            gte: vi.fn().mockReturnThis(),
+            order: vi.fn().mockReturnThis(),
+            limit: vi.fn().mockResolvedValue({ data: payments, error: null }),
+          };
+        }
+        const isDuplicateCheck = paymentsCallCount === 2 || paymentsCallCount === 4;
+        if (isDuplicateCheck) {
+          return {
+            select: vi.fn().mockReturnThis(),
+            eq: vi.fn().mockReturnThis(),
+            neq: vi.fn().mockReturnThis(),
+            maybeSingle: vi.fn().mockResolvedValue({ data: null, error: null }),
+          };
+        }
+        return {
+          update: vi.fn().mockReturnValue({
+            eq: vi.fn().mockReturnThis(),
+            is: vi.fn().mockReturnThis(),
+            select: vi.fn().mockReturnThis(),
+            maybeSingle: vi.fn().mockResolvedValue({ data: { id: "updated" }, error: null }),
+          }),
+        };
+      });
+
+      mockFindMatchingPayment.mockImplementation(({ recipient }) =>
+        Promise.resolve({
+          id: `op-${recipient}`,
+          transaction_hash: `tx-${recipient}`,
+          received_amount: "10.0000000",
+        })
+      );
 
       await pollOnce();
 
-      expect(mockFindMatchingPayment).not.toHaveBeenCalled();
+      const merchantLookups = mockSupabaseFrom.mock.calls.filter(([table]) => table === "merchants");
+      expect(merchantLookups).toHaveLength(1);
+    });
+  });
+
+  describe("Ledger Monitor rate limiter", () => {
+    it("delays Horizon calls after the burst is exhausted", async () => {
+      let now = 0;
+      const sleepFn = vi.fn(async (ms) => {
+        now += ms;
+      });
+      const limiter = createLedgerMonitorRateLimiter({
+        maxPerSecond: 2,
+        burst: 1,
+        now: () => now,
+        sleepFn,
+      });
+
+      await limiter.waitForSlot();
+      await limiter.waitForSlot();
+
+      expect(sleepFn).toHaveBeenCalledWith(500);
+    });
+  });
+
+  describe("wrong-amount signature verification", () => {
+    it("does not mark an underpayment failed when transaction signature verification fails", async () => {
+      const payment = makePayment({ amount: "10.0000000" });
+      const updateMock = vi.fn();
+
+      mockSupabaseFrom.mockImplementation(() => ({
+        select: vi.fn().mockReturnThis(),
+        eq: vi.fn().mockReturnThis(),
+        is: vi.fn().mockReturnThis(),
+        gte: vi.fn().mockReturnThis(),
+        order: vi.fn().mockReturnThis(),
+        limit: vi.fn().mockResolvedValue({ data: [payment], error: null }),
+        update: updateMock,
+      }));
+
+      mockFindMatchingPayment.mockResolvedValue(null);
+      mockFindAnyRecentPayment.mockResolvedValue({
+        transaction_hash: "tx-under-bad-signature",
+        received_amount: "5.0000000",
+      });
+      mockVerifyTransactionSignature.mockResolvedValue({
+        valid: false,
+        reason: "bad signature",
+        isMultiSig: false,
+        signatureCount: 0,
+        thresholdMet: false,
+      });
+
+      await pollOnce();
+
+      expect(updateMock).not.toHaveBeenCalled();
+      expect(mockStreamManagerNotify).not.toHaveBeenCalled();
     });
   });
 });
