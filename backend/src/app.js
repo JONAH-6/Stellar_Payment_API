@@ -1,4 +1,5 @@
 import cors from "cors";
+import helmet from "helmet";
 import express from "express";
 import { Server as SocketIOServer } from "socket.io";
 import swaggerUi from "swagger-ui-express";
@@ -14,6 +15,7 @@ import metricsRouter from "./routes/metrics.js";
 import webhooksRouter from "./routes/webhooks.js";
 import prometheusRouter from "./routes/prometheus.js";
 import sep0001Router from "./routes/sep0001.js";
+import createSep12Router from "./routes/sep12.js";
 import paymentDetailsRouter from "./routes/paymentDetails.js";
 import x402Router from "./routes/x402.js";
 import authRouter from "./routes/auth.js";
@@ -139,7 +141,20 @@ export async function createApp({ redisClient }) {
     })
   );
 
+  app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false,
+  }));
+
   app.use(express.json({ limit: "1mb" }));
+
+  // Explicit JSON parsing error handler
+  app.use((err, req, res, next) => {
+    if (err instanceof SyntaxError && err.status === 400 && "body" in err) {
+      return res.status(400).json({ error: "Invalid JSON payload" });
+    }
+    next(err);
+  });
   // Structured JSON logging via pino-http (replaces morgan)
   app.use(httpLogger);
   // Expose the root logger on app.locals so routes can use req.log or app.locals.logger
@@ -278,6 +293,9 @@ export async function createApp({ redisClient }) {
 
   // SEP-0001 stellar.toml endpoint (public, no auth required)
   app.use("/", sep0001Router);
+
+  // SEP-12 KYC endpoints (signature-gated; auth enforced per-request)
+  app.use("/", createSep12Router());
 
   // Prometheus Metrics endpoint
   app.use("/", prometheusRouter);

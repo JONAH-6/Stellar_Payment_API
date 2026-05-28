@@ -2,17 +2,19 @@ import "dotenv/config";
 import { randomUUID } from "node:crypto";
 import { logger } from "../lib/logger.js";
 import express from "express";
-import rateLimit from "express-rate-limit";
 import { paymentService } from "../services/paymentService.js";
+import { resolveAssetIssuer } from "../constants/assetConstants.js";
 import { validateUuidParam } from "../lib/validate-uuid.js";
 import {
   paymentSessionZodSchema,
+  paymentZodSchema,
   refundConfirmSchema,
   pathPaymentQuoteQuerySchema,
   paymentsListQuerySchema
 } from "../lib/request-schemas.js";
 import { validateRequest } from "../lib/validation.js";
 import { createCreatePaymentRateLimit } from "../lib/create-payment-rate-limit.js";
+import { createVerifyPaymentRateLimit } from "../lib/rate-limit.js";
 import { recaptchaMiddleware } from "../lib/recaptcha.js";
 import { sendWebhook, isEventSubscribed } from "../lib/webhooks.js";
 import { sendReceiptEmail } from "../lib/email.js";
@@ -35,24 +37,44 @@ import {
   paymentFailedCounter,
 } from "../lib/metrics.js";
 import { sanitizeMetadataMiddleware } from "../lib/sanitize-metadata.js";
-import { supabase } from "../lib/supabase.js";
 import {
   findMatchingPayment,
   findAnyRecentPayment,
   findStrictReceivePaths,
   getNetworkFeeStats,
+  isValidStellarPublicKey,
+  verifyTransactionSignature,
 } from "../lib/stellar.js";
 
 
 const createPaymentRateLimit = createCreatePaymentRateLimit();
 
-const defaultVerifyPaymentRateLimit = rateLimit({
-  windowMs: 60 * 1000, // 1 minute window
-  max: 30,             // 30 requests per minute per IP (covers 10s polling)
-  message: { error: "Too many verification requests, please try again later." },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const defaultVerifyPaymentRateLimit = createVerifyPaymentRateLimit();
+let supabaseClientPromise;
+
+function isSignatureVerificationAccepted(result) {
+  if (result === true) {
+    return true;
+  }
+
+  return Boolean(result && typeof result === "object" && result.valid === true);
+}
+
+async function verifyTransactionSignatureIfAvailable(txHash) {
+  if (typeof verifyTransactionSignature !== "function") {
+    return { valid: true, skipped: true };
+  }
+
+  return verifyTransactionSignature(txHash);
+}
+
+async function getSupabaseClient() {
+  if (!supabaseClientPromise) {
+    supabaseClientPromise = import("../lib/supabase.js").then((module) => module.supabase);
+  }
+
+  return supabaseClientPromise;
+}
 
 
 
@@ -214,8 +236,25 @@ function createPaymentsRouter({
    */
   async function createSession(req, res, next) {
     try {
+      const supabase = await getSupabaseClient();
       const body = req.body;
+      const asset = body.asset?.toUpperCase();
+      const assetIssuer = resolveAssetIssuer(asset, body.asset_issuer);
       logger.info({ merchantId: req.merchant?.id, amount: body.amount, asset: body.asset }, "DEBUG: createSession started");
+
+      if (asset !== "XLM" && !assetIssuer) {
+        paymentFailedCounter.inc({ asset: body.asset, reason: "missing_issuer" });
+        return res.status(400).json({
+          error: "asset_issuer is required for non-native assets",
+        });
+      }
+
+      if (asset !== "XLM" && !isValidStellarPublicKey(assetIssuer)) {
+        paymentFailedCounter.inc({ asset: body.asset, reason: "invalid_issuer" });
+        return res.status(400).json({
+          error: "asset_issuer must be a valid Stellar public key",
+        });
+      }
 
       // Per-asset payment limit validation (#153)
       const limits = req.merchant.payment_limits;
@@ -244,8 +283,8 @@ function createPaymentsRouter({
       // Allowed-issuers check: if the merchant has configured a non-empty
       // allowlist, only those issuer addresses may be used.
       const allowedIssuers = req.merchant.allowed_issuers;
-      if (Array.isArray(allowedIssuers) && allowedIssuers.length > 0) {
-        if (!body.asset_issuer || !allowedIssuers.includes(body.asset_issuer)) {
+      if (asset !== "XLM" && Array.isArray(allowedIssuers) && allowedIssuers.length > 0) {
+        if (!assetIssuer || !allowedIssuers.includes(assetIssuer)) {
           paymentFailedCounter.inc({ asset: body.asset, reason: "invalid_issuer" });
           return res.status(400).json({
             error:
@@ -276,12 +315,12 @@ function createPaymentsRouter({
         id: paymentId,
         merchant_id: req.merchant.id,
         amount: body.amount,
-        asset: body.asset,
-        asset_issuer: body.asset_issuer || null,
+        asset,
+        asset_issuer: assetIssuer || null,
         recipient: body.recipient,
         description: body.description || null,
-        memo: body.memo || null,
-        memo_type: body.memo_type || null,
+        memo: body.message || body.memo || null,
+        memo_type: body.message ? "text" : (body.memo_type || null),
         webhook_url: body.webhook_url || null,
         client_id: body.client_id || null,
         status: "pending",
@@ -324,6 +363,7 @@ function createPaymentsRouter({
 
   router.post("/create-payment", createPaymentRateLimit, recaptchaMiddleware(), validateRequest({ body: paymentSessionZodSchema }), sanitizeMetadataMiddleware, createSession);
   router.post("/sessions", createPaymentRateLimit, validateRequest({ body: paymentSessionZodSchema }), sanitizeMetadataMiddleware, createSession);
+  router.post("/support-transactions", createPaymentRateLimit, validateRequest({ body: paymentZodSchema }), sanitizeMetadataMiddleware, createSession);
 
   /**
    * @swagger
@@ -356,6 +396,7 @@ function createPaymentsRouter({
     validateUuidParam(),
     async (req, res, next) => {
       try {
+        const supabase = await getSupabaseClient();
         // --- Redis read-through cache ---
         const redis = await connectRedisClient();
         const cached = await getCachedPayment(redis, req.params.id);
@@ -510,6 +551,7 @@ function createPaymentsRouter({
     validateUuidParam(),
     async (req, res, next) => {
       try {
+        const supabase = await getSupabaseClient();
         let query = supabase
           .from("payments")
           .select(
@@ -554,6 +596,13 @@ function createPaymentsRouter({
           memoType: data.memo_type,
           createdAt: data.created_at,
         });
+
+        if (match) {
+          const signatureResult = await verifyTransactionSignatureIfAvailable(match.transaction_hash);
+          if (!isSignatureVerificationAccepted(signatureResult)) {
+            return res.json({ status: "pending" });
+          }
+        }
 
         if (!match) {
           // Check if a payment arrived but with the wrong amount
@@ -837,69 +886,11 @@ function createPaymentsRouter({
    */
   router.get("/payments", validateRequest({ query: paymentsListQuerySchema }), async (req, res, next) => {
     try {
-      let page = parseInt(req.query.page, 10) || 1;
-      let limit = parseInt(req.query.limit, 10) || 10;
-      const clientId =
-        typeof req.query.client_id === "string" && req.query.client_id.trim()
-          ? req.query.client_id.trim()
-          : null;
-
-      if (page < 1) page = 1;
-      if (limit < 1) limit = 1;
-      if (limit > 100) limit = 100;
-
-      const offset = (page - 1) * limit;
-
-      let countQuery = supabase
-        .from("payments")
-        .select("*", { count: "exact", head: true })
-        .eq("merchant_id", req.merchant.id)
-        .is("deleted_at", null);
-      if (clientId) {
-        countQuery = countQuery.eq("client_id", clientId);
-      }
-      countQuery = applyPaymentFilters(countQuery, req);
-      countQuery = applyMetadataFilters(countQuery, req.query);
-
-      const { count: totalCount, error: countError } = await countQuery;
-
-      if (countError) {
-        countError.status = 500;
-        throw countError;
-      }
-
-      let dataQuery = supabase
-        .from("payments")
-        .select(
-          "id, amount, asset, asset_issuer, recipient, description, client_id, status, tx_id, created_at",
-        )
-        .eq("merchant_id", req.merchant.id)
-        .is("deleted_at", null)
-        .order("created_at", { ascending: false });
-      if (clientId) {
-        dataQuery = dataQuery.eq("client_id", clientId);
-      }
-      dataQuery = applyPaymentFilters(dataQuery, req);
-      dataQuery = applyMetadataFilters(dataQuery, req.query);
-      const { data: payments, error: dataError } = await dataQuery.range(
-        offset,
-        offset + limit - 1,
-      );
-
-      if (dataError) {
-        dataError.status = 500;
-        throw dataError;
-      }
-
-      const totalPages = Math.ceil(totalCount / limit);
+      const result = await paymentService.getMerchantPayments(req.merchant.id, req.query);
 
       res.json({
-        payments: payments || [],
-        total_count: totalCount,
-        total_pages: totalPages,
-        page,
-        limit,
-        ...generatePaginationLinks(req, page, limit, totalPages),
+        ...result,
+        ...generatePaginationLinks(req, result.page, result.limit, result.total_pages),
       });
     } catch (err) {
       next(err);
@@ -947,70 +938,8 @@ function createPaymentsRouter({
    */
   router.get("/metrics/7day", async (req, res, next) => {
     try {
-      const sevenDaysAgo = new Date();
-      sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
-
-      const { data: payments, error } = await supabase
-        .from("payments")
-        .select("amount, created_at, status")
-        .eq("merchant_id", req.merchant.id)
-        .gte("created_at", sevenDaysAgo.toISOString())
-        .order("created_at", { ascending: true });
-
-      if (error) {
-        error.status = 500;
-        throw error;
-      }
-
-      const metricsMap = new Map();
-      let totalVolume = 0;
-      let confirmedCount = 0;
-
-      payments.forEach((payment) => {
-        const date = new Date(payment.created_at).toISOString().split("T")[0];
-        const volume = Number(payment.amount) || 0;
-
-        if (!metricsMap.has(date)) {
-          metricsMap.set(date, { date, volume: 0, count: 0, confirmed_count: 0 });
-        }
-
-        const dayMetric = metricsMap.get(date);
-        dayMetric.volume += volume;
-        dayMetric.count += 1;
-        
-        if (payment.status === "confirmed") {
-          dayMetric.confirmed_count += 1;
-          confirmedCount += 1;
-        }
-        
-        totalVolume += volume;
-      });
-
-      const data = [];
-      for (let i = 6; i >= 0; i -= 1) {
-        const date = new Date();
-        date.setDate(date.getDate() - i);
-        const dateStr = date.toISOString().split("T")[0];
-
-        if (metricsMap.has(dateStr)) {
-          data.push(metricsMap.get(dateStr));
-        } else {
-          data.push({ date: dateStr, volume: 0, count: 0, confirmed_count: 0 });
-        }
-      }
-
-      const totalPayments = payments.length;
-      const successRate = totalPayments > 0 
-        ? Number(((confirmedCount / totalPayments) * 100).toFixed(1)) 
-        : 0;
-
-      res.json({
-        data,
-        total_volume: Number(totalVolume.toFixed(2)),
-        total_payments: totalPayments,
-        confirmed_count: confirmedCount,
-        success_rate: successRate,
-      });
+      const result = await paymentService.getRollingMetrics(req.merchant.id);
+      res.json(result);
     } catch (err) {
       next(err);
     }
@@ -1104,6 +1033,7 @@ function createPaymentsRouter({
     async (req, res, next) => {
       try {
         const { tx_hash } = req.body;
+        const supabase = await getSupabaseClient();
 
         const { data: payment, error } = await supabase
           .from("payments")
@@ -1210,6 +1140,7 @@ function createPaymentsRouter({
     validateRequest({ query: pathPaymentQuoteQuerySchema }),
     async (req, res, next) => {
       try {
+        const supabase = await getSupabaseClient();
         const sourceAsset = req.query.source_asset;
         const sourceAssetIssuer = req.query.source_asset_issuer || null;
         const sourceAccount = req.query.source_account;
@@ -1234,6 +1165,13 @@ function createPaymentsRouter({
 
         if (!data) {
           return res.status(404).json({ error: "Payment not found" });
+        }
+
+        if (data.status !== "pending") {
+          return res.status(409).json({
+            error: "Path payment quote is only available for pending payments",
+            status: data.status,
+          });
         }
 
         const sameAsset =
@@ -1370,6 +1308,7 @@ function createPaymentsRouter({
    */
   router.delete("/payments/:id", validateUuidParam(), async (req, res, next) => {
     try {
+      const supabase = await getSupabaseClient();
       // First check if payment exists and is not already deleted
       const { data: existing, error: fetchError } = await supabase
         .from("payments")

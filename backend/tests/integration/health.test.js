@@ -15,7 +15,14 @@ const mockRedisClient = {
 };
 
 vi.mock("../../src/lib/stellar.js", () => ({
+  findMatchingPayment: vi.fn(),
+  findAnyRecentPayment: vi.fn(),
+  findStrictReceivePaths: vi.fn(),
+  getNetworkFeeStats: vi.fn(),
   isHorizonReachable: vi.fn(async () => true),
+  isValidStellarPublicKey: vi.fn(() => true),
+  validateMemo: vi.fn(() => ({ valid: true })),
+  verifyTransactionSignature: vi.fn(),
 }));
 
 vi.mock("../../src/lib/supabase.js", () => {

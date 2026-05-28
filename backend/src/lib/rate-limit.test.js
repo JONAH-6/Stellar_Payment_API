@@ -1,8 +1,24 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("rate-limit-redis", () => ({
+  RedisStore: vi.fn(),
+}));
+
+vi.mock("redis", () => ({
+  createClient: vi.fn(),
+}));
+
 import {
+  createMerchantSecurityActionRateLimit,
   createRedisRateLimitStore,
   createVerifyPaymentRateLimit,
+  getMerchantSecurityActionRateLimitKey,
+  getVerifyPaymentRateLimitKey,
+  MERCHANT_SECURITY_ACTION_RATE_LIMIT_MAX,
+  MERCHANT_SECURITY_ACTION_RATE_LIMIT_WINDOW_MS,
   RATE_LIMIT_REDIS_PREFIX,
+  VERIFY_PAYMENT_RATE_LIMIT_MAX,
+  VERIFY_PAYMENT_RATE_LIMIT_WINDOW_MS,
 } from "./rate-limit.js";
 import {
   connectRedisClient,
@@ -41,14 +57,96 @@ describe("createVerifyPaymentRateLimit", () => {
 
     expect(result).toBe(middleware);
     expect(rateLimitFactory).toHaveBeenCalledWith({
-      windowMs: 15 * 60 * 1000,
-      max: 10,
+      windowMs: VERIFY_PAYMENT_RATE_LIMIT_WINDOW_MS,
+      max: VERIFY_PAYMENT_RATE_LIMIT_MAX,
       message: { error: "Too many verification requests, please try again later." },
       standardHeaders: true,
       legacyHeaders: false,
+      validate: { ip: false },
+      keyGenerator: expect.any(Function),
       requestWasSuccessful: expect.any(Function),
       store,
+      passOnStoreError: true,
     });
+  });
+});
+
+describe("getVerifyPaymentRateLimitKey", () => {
+  it("keys by payment id and merchant when merchant auth is present", () => {
+    expect(
+      getVerifyPaymentRateLimitKey({
+        params: { id: "payment-123" },
+        merchant: { id: "merchant-789" },
+        headers: {},
+        ip: "127.0.0.1",
+      }),
+    ).toBe("payment-123:merchant:merchant-789");
+  });
+
+  it("hashes api keys instead of storing them in limiter keys", () => {
+    const key = getVerifyPaymentRateLimitKey({
+      params: { id: "payment-123" },
+      headers: { "x-api-key": "secret-api-key" },
+      ip: "127.0.0.1",
+    });
+
+    expect(key).toMatch(/^payment-123:api:[a-f0-9]{64}$/);
+    expect(key).not.toContain("secret-api-key");
+  });
+
+  it("falls back to ip-based keys when no merchant or api key is available", () => {
+    expect(
+      getVerifyPaymentRateLimitKey({
+        params: { id: "payment-123" },
+        headers: {},
+        ip: "203.0.113.10",
+      }),
+    ).toBe("payment-123:ip:203.0.113.10");
+  });
+});
+
+describe("createMerchantSecurityActionRateLimit", () => {
+  it("passes the merchant security action config into express-rate-limit", () => {
+    const store = { kind: "redis-store" };
+    const middleware = vi.fn();
+    const rateLimitFactory = vi.fn(() => middleware);
+
+    const result = createMerchantSecurityActionRateLimit({ store, rateLimitFactory });
+
+    expect(result).toBe(middleware);
+    expect(rateLimitFactory).toHaveBeenCalledWith({
+      windowMs: MERCHANT_SECURITY_ACTION_RATE_LIMIT_WINDOW_MS,
+      max: MERCHANT_SECURITY_ACTION_RATE_LIMIT_MAX,
+      message: { error: "Too many sensitive merchant actions, please try again later." },
+      standardHeaders: true,
+      legacyHeaders: false,
+      validate: { ip: false },
+      keyGenerator: expect.any(Function),
+      requestWasSuccessful: expect.any(Function),
+      store,
+      passOnStoreError: true,
+    });
+  });
+});
+
+describe("getMerchantSecurityActionRateLimitKey", () => {
+  it("uses merchant ids when available", () => {
+    expect(
+      getMerchantSecurityActionRateLimitKey({
+        merchant: { id: "merchant-456" },
+        headers: {},
+        ip: "203.0.113.10",
+      }),
+    ).toBe("merchant:merchant-456");
+  });
+
+  it("hashes api keys when merchant context is unavailable", () => {
+    expect(
+      getMerchantSecurityActionRateLimitKey({
+        headers: { "x-api-key": "issuer-secret-key" },
+        ip: "203.0.113.10",
+      }),
+    ).toMatch(/^api:[a-f0-9]{64}$/);
   });
 });
 

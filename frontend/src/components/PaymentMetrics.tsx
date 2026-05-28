@@ -1,6 +1,6 @@
-"use client";
+﻿"use client";
 
-import { useEffect, useRef, useState, type RefObject } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import * as Recharts from "recharts";
 const {
@@ -13,23 +13,15 @@ const {
   XAxis,
   YAxis,
 } = Recharts;
-import toast from "react-hot-toast";
 import {
   useHydrateMerchantStore,
   useMerchantApiKey,
   useMerchantHydrated,
 } from "@/lib/merchant-store";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { localeToLanguageTag } from "@/i18n/config";
 import DensityGrid from "@/components/DensityGrid";
 
 type TimeRange = "7D" | "30D" | "1Y";
-type ExportFormat = "png" | "svg";
 
 interface VolumeDataPoint {
   date: string;
@@ -56,7 +48,6 @@ interface MetricsResponse {
 }
 
 const CHART_HEIGHT = 300;
-const EXPORT_SCALE = 2;
 
 const ASSET_COLORS: Record<string, string> = {
   USDC: "#0A0A0A",
@@ -73,7 +64,7 @@ function colorForAsset(asset: string, index: number): string {
 function computeMovingAverages(
   data: VolumeDataPoint[],
   assets: string[],
-  window = 7
+  window = 7,
 ): Record<string, number[]> {
   const result: Record<string, number[]> = {};
   for (const asset of assets) {
@@ -90,170 +81,11 @@ function computeMovingAverages(
   return result;
 }
 
-function buildSvgMarkup(svg: SVGSVGElement): {
-  markup: string;
-  width: number;
-  height: number;
-} {
-  const clone = svg.cloneNode(true) as SVGSVGElement;
-  const bounds = svg.getBoundingClientRect();
-  const width = Math.max(Math.round(bounds.width), 1);
-  const height = Math.max(Math.round(bounds.height), 1);
-
-  clone.setAttribute("xmlns", "http://www.w3.org/2000/svg");
-  clone.setAttribute("xmlns:xlink", "http://www.w3.org/1999/xlink");
-  clone.setAttribute("width", String(width));
-  clone.setAttribute("height", String(height));
-
-  if (!clone.getAttribute("viewBox")) {
-    clone.setAttribute("viewBox", `0 0 ${width} ${height}`);
-  }
-
-  const background = document.createElementNS(
-    "http://www.w3.org/2000/svg",
-    "rect"
-  );
-  background.setAttribute("width", "100%");
-  background.setAttribute("height", "100%");
-  background.setAttribute("fill", "#FFFFFF");
-  clone.insertBefore(background, clone.firstChild);
-
-  return {
-    markup: new XMLSerializer().serializeToString(clone),
-    width,
-    height,
-  };
-}
-
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = filename;
-  link.click();
-  URL.revokeObjectURL(url);
-}
-
-async function exportChart(
-  containerRef: RefObject<HTMLDivElement>,
-  format: ExportFormat,
-  filename: string
-) {
-  const svg =
-    containerRef.current?.querySelector("[data-export-chart] svg") ??
-    containerRef.current?.querySelector("svg");
-  if (!(svg instanceof SVGSVGElement)) {
-    throw new Error(
-      "Chart export is unavailable until the chart finishes rendering."
-    );
-  }
-
-  const { markup, width, height } = buildSvgMarkup(svg);
-  const svgBlob = new Blob([markup], {
-    type: "image/svg+xml;charset=utf-8",
-  });
-
-  if (format === "svg") {
-    downloadBlob(svgBlob, `${filename}.svg`);
-    return;
-  }
-
-  const url = URL.createObjectURL(svgBlob);
-
-  try {
-    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
-      const nextImage = new Image();
-      nextImage.onload = () => resolve(nextImage);
-      nextImage.onerror = () =>
-        reject(new Error("Failed to load chart for PNG export."));
-      nextImage.src = url;
-    });
-
-    const canvas = document.createElement("canvas");
-    canvas.width = width * EXPORT_SCALE;
-    canvas.height = height * EXPORT_SCALE;
-
-    const context = canvas.getContext("2d");
-    if (!context) {
-      throw new Error("Canvas export is not available in this browser.");
-    }
-
-    context.scale(EXPORT_SCALE, EXPORT_SCALE);
-    context.drawImage(image, 0, 0, width, height);
-
-    const pngBlob = await new Promise<Blob | null>((resolve) => {
-      canvas.toBlob(resolve, "image/png");
-    });
-
-    if (!pngBlob) {
-      throw new Error("Failed to generate PNG export.");
-    }
-
-    downloadBlob(pngBlob, `${filename}.png`);
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
-function ChartExportButton({
-  containerRef,
-  exporting,
-  onExport,
-  t,
-}: {
-  containerRef: RefObject<HTMLDivElement>;
-  exporting: boolean;
-  onExport: (
-    format: ExportFormat,
-    containerRef: RefObject<HTMLDivElement>
-  ) => Promise<void>;
-  t: ReturnType<typeof useTranslations>;
-}) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          disabled={exporting}
-          className="inline-flex items-center gap-2 rounded-[6px] border border-[#E8E8E8] bg-white px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[#0A0A0A] transition-all hover:bg-[#F5F5F5] disabled:cursor-not-allowed disabled:opacity-50"
-          aria-label={exporting ? t("exporting") : t("downloadImage")}
-        >
-          <svg
-            viewBox="0 0 24 24"
-            className="h-4 w-4"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.8}
-            aria-hidden="true"
-          >
-            <path d="M12 4v10" strokeLinecap="round" strokeLinejoin="round" />
-            <path
-              d="m8.5 10.5 3.5 3.5 3.5-3.5"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-            <path d="M5 18.5h14" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-          {exporting ? t("exporting") : t("downloadImage")}
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuItem onSelect={() => void onExport("png", containerRef)}>
-          {t("downloadPng")}
-        </DropdownMenuItem>
-        <DropdownMenuItem onSelect={() => void onExport("svg", containerRef)}>
-          {t("downloadSvg")}
-        </DropdownMenuItem>
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
 export default function PaymentMetrics({
   showSkeleton = false,
-}: {
+}: Readonly<{
   showSkeleton?: boolean;
-}) {
+}>) {
   const t = useTranslations("paymentMetrics");
   const locale = localeToLanguageTag(useLocale());
   const [summary, setSummary] = useState<MetricsResponse | null>(null);
@@ -261,54 +93,20 @@ export default function PaymentMetrics({
   const [hiddenAssets, setHiddenAssets] = useState<Set<string>>(new Set());
   const [range, setRange] = useState<TimeRange>("7D");
   const [loading, setLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [exporting, setExporting] = useState(false);
+  const [nonBlockingError, setNonBlockingError] = useState<string | null>(null);
+  const [refreshToken, setRefreshToken] = useState(0);
   const apiKey = useMerchantApiKey();
   const hydrated = useMerchantHydrated();
   const chartContainerRef = useRef<HTMLDivElement>(null);
-
-  const handleExport = async (format: ExportFormat) => {
-    if (!chartContainerRef.current) return;
-    try {
-      setExporting(true);
-      await exportChart(chartContainerRef, format, `metrics-export-${new Date().getTime()}`);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : t("exportFailed"));
-    } finally {
-      setExporting(false);
-    }
-  };
+  const hasLoadedDataRef = useRef(false);
+  const chartTitleId = useId();
+  const chartDescriptionId = useId();
+  const chartSummaryId = useId();
+  const chartTableId = useId();
 
   useHydrateMerchantStore();
-
-  useEffect(() => {
-    if (!hydrated || !apiKey) return;
-
-    const controller = new AbortController();
-    const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
-
-    fetch(`${apiUrl}/api/metrics/7day`, {
-      headers: { "x-api-key": apiKey },
-      signal: controller.signal,
-    })
-      .then((response) =>
-        response.ok
-          ? response.json()
-          : Promise.reject(new Error(t("fetchMetricsFailed")))
-      )
-      .then((data: MetricsResponse) => setSummary(data))
-      .catch((fetchError) => {
-        if (fetchError instanceof Error && fetchError.name === "AbortError")
-          return;
-        setError(
-          fetchError instanceof Error
-            ? fetchError.message
-            : t("fetchMetricsFailed")
-        );
-      });
-
-    return () => controller.abort();
-  }, [apiKey, hydrated, t]);
 
   useEffect(() => {
     if (!hydrated || !apiKey) {
@@ -317,33 +115,84 @@ export default function PaymentMetrics({
     }
 
     const controller = new AbortController();
-    setLoading(true);
-
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
+    let isCancelled = false;
+    const hasCachedData = hasLoadedDataRef.current;
 
-    fetch(`${apiUrl}/api/metrics/volume?range=${range}`, {
-      headers: { "x-api-key": apiKey },
-      signal: controller.signal,
-    })
-      .then((response) =>
-        response.ok
-          ? response.json()
-          : Promise.reject(new Error(t("fetchVolumeFailed")))
-      )
-      .then((data: VolumeResponse) => setVolumeData(data))
-      .catch((fetchError) => {
-        if (fetchError instanceof Error && fetchError.name === "AbortError")
+    setNonBlockingError(null);
+    if (hasCachedData) {
+      setIsRefreshing(true);
+    } else {
+      setLoading(true);
+      setError(null);
+    }
+
+    async function fetchMetrics() {
+      try {
+        const [summaryResponse, volumeResponse] = await Promise.all([
+          fetch(`${apiUrl}/api/metrics/7day`, {
+            headers: { "x-api-key": apiKey },
+            signal: controller.signal,
+          }),
+          fetch(`${apiUrl}/api/metrics/volume?range=${range}`, {
+            headers: { "x-api-key": apiKey },
+            signal: controller.signal,
+          }),
+        ]);
+
+        if (!summaryResponse.ok) {
+          throw new Error(t("fetchMetricsFailed"));
+        }
+
+        if (!volumeResponse.ok) {
+          throw new Error(t("fetchVolumeFailed"));
+        }
+
+        const [summaryData, volumePayload] = await Promise.all([
+          summaryResponse.json() as Promise<MetricsResponse>,
+          volumeResponse.json() as Promise<VolumeResponse>,
+        ]);
+
+        if (isCancelled) {
           return;
-        setError(
+        }
+
+        setSummary(summaryData);
+        setVolumeData(volumePayload);
+        hasLoadedDataRef.current = true;
+        // Keep only hidden assets that still exist in the refreshed payload.
+        setHiddenAssets((prev) => {
+          const available = new Set(volumePayload.assets ?? []);
+          return new Set([...prev].filter((asset) => available.has(asset)));
+        });
+      } catch (fetchError) {
+        if (fetchError instanceof Error && fetchError.name === "AbortError") {
+          return;
+        }
+        const nextError =
           fetchError instanceof Error
             ? fetchError.message
-            : t("fetchVolumeFailed")
-        );
-      })
-      .finally(() => setLoading(false));
+            : t("fetchMetricsFailed");
+        if (hasCachedData) {
+          setNonBlockingError(nextError);
+        } else {
+          setError(nextError);
+        }
+      } finally {
+        if (!isCancelled) {
+          setLoading(false);
+          setIsRefreshing(false);
+        }
+      }
+    }
 
-    return () => controller.abort();
-  }, [apiKey, hydrated, range, t]);
+    void fetchMetrics();
+
+    return () => {
+      isCancelled = true;
+      controller.abort();
+    };
+  }, [apiKey, hydrated, range, refreshToken, t]);
 
   const toggleAsset = (asset: string) => {
     setHiddenAssets((prev) => {
@@ -373,7 +222,7 @@ export default function PaymentMetrics({
         <p className="text-sm text-yellow-400">{error}</p>
         <button
           type="button"
-          onClick={() => setError(null)}
+          onClick={() => setRefreshToken((current) => current + 1)}
           className="mt-3 text-xs text-slate-400 underline"
         >
           {t("retry")}
@@ -391,7 +240,7 @@ export default function PaymentMetrics({
       day: "numeric",
     }),
     ...Object.fromEntries(
-      assets.map((asset) => [`${asset}_ma`, maAverages[asset]?.[i] ?? 0])
+      assets.map((asset) => [`${asset}_ma`, maAverages[asset]?.[i] ?? 0]),
     ),
   }));
   const densityData =
@@ -404,6 +253,11 @@ export default function PaymentMetrics({
               : Number(dataPoint.count) || 0,
         }))
       : [];
+  const visibleAssets = assets.filter((asset) => !hiddenAssets.has(asset));
+  const chartSummary =
+    assets.length === 0
+      ? `${t("chartTitle")}. ${t("noPayments")}.`
+      : `${t("chartTitle")}. ${t("chartSubtitle")}. Range ${range}. Showing ${visibleAssets.length} of ${assets.length} assets across ${chartData.length} time periods.`;
 
   return (
     <div className="flex flex-col gap-6">
@@ -444,9 +298,9 @@ export default function PaymentMetrics({
                 {summary.success_rate}%
               </p>
               <div className="flex h-1.5 w-full max-w-[60px] overflow-hidden rounded-full bg-slate-800">
-                <div 
-                  className="bg-mint" 
-                  style={{ width: `${summary.success_rate}%` }} 
+                <div
+                  className="bg-mint"
+                  style={{ width: `${summary.success_rate}%` }}
                 />
               </div>
             </div>
@@ -454,17 +308,40 @@ export default function PaymentMetrics({
         </div>
       )}
 
-      <div
+      <section
         ref={chartContainerRef}
+        aria-labelledby={chartTitleId}
+        aria-describedby={`${chartDescriptionId} ${chartSummaryId} ${chartTableId}`}
         className="flex flex-col gap-8 rounded-lg border border-[#E8E8E8] bg-white p-8"
       >
+        <div id={chartSummaryId} className="sr-only" aria-live="polite">
+          {chartSummary}
+        </div>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h3 className="text-sm font-bold text-[#0A0A0A] uppercase tracking-wider">{t("chartTitle")}</h3>
-            <p className="text-[10px] font-medium text-[#6B6B6B] uppercase tracking-widest mt-1">{t("chartSubtitle")}</p>
+            <h3
+              id={chartTitleId}
+              className="text-sm font-bold text-[#0A0A0A] uppercase tracking-wider"
+            >
+              {t("chartTitle")}
+            </h3>
+            <p
+              id={chartDescriptionId}
+              className="text-[10px] font-medium text-[#6B6B6B] uppercase tracking-widest mt-1"
+            >
+              {t("chartSubtitle")}
+            </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            {isRefreshing && (
+              <span
+                className="rounded-full border border-[#E8E8E8] bg-[#F5F5F5] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#6B6B6B]"
+                aria-live="polite"
+              >
+                Updating...
+              </span>
+            )}
             <div className="flex gap-0.5 rounded-md border border-[#E8E8E8] bg-[#F5F5F5] p-0.5">
               {TIME_RANGES.map((nextRange) => (
                 <button
@@ -482,22 +359,20 @@ export default function PaymentMetrics({
                 </button>
               ))}
             </div>
-
-            {assets.length > 0 && (
-              <ChartExportButton
-                containerRef={chartContainerRef}
-                exporting={exporting}
-                onExport={handleExport}
-                t={t}
-              />
-            )}
           </div>
         </div>
+        {nonBlockingError && (
+          <p
+            className="rounded-md border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-700"
+            role="status"
+          >
+            {nonBlockingError}
+          </p>
+        )}
 
         {assets.length > 0 && (
           <div
             className="flex flex-wrap gap-2"
-            role="group"
             aria-label={t("toggleAssetVisibility")}
           >
             {assets.map((asset, index) => {
@@ -541,7 +416,34 @@ export default function PaymentMetrics({
             {t("noPayments")}
           </p>
         ) : (
-          <div data-export-chart>
+          <>
+            <table id={chartTableId} className="sr-only">
+              <caption>{`${t("chartTitle")} data table`}</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Date</th>
+                  {visibleAssets.map((asset) => (
+                    <th key={asset} scope="col">{asset}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {chartData.map((dataPoint) => (
+                  <tr key={dataPoint.date}>
+                    <th scope="row">{dataPoint.dateShort}</th>
+                    {visibleAssets.map((asset) => (
+                      <td key={`${dataPoint.date}-${asset}`}>
+                        {typeof dataPoint[asset] === "number"
+                          ? dataPoint[asset].toLocaleString()
+                          : Number(dataPoint[asset] || 0).toLocaleString()}
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+
+            <div data-export-chart aria-hidden="true">
             <ResponsiveContainer width="100%" height={CHART_HEIGHT}>
               <LineChart
                 data={chartData}
@@ -569,17 +471,29 @@ export default function PaymentMetrics({
                 />
                 <Tooltip
                   contentStyle={{
-                    backgroundColor: "#FFFFFF",
-                    border: "1px solid #E8E8E8",
-                    borderRadius: "4px",
-                    padding: "12px",
-                    boxShadow: "0 4px 12px rgba(0,0,0,0.05)"
+                    backgroundColor: "rgba(255, 255, 255, 0.95)",
+                    border: "1px solid var(--pluto-100)",
+                    borderRadius: "16px",
+                    padding: "16px",
+                    boxShadow: "0 20px 50px rgba(0, 0, 0, 0.12)",
+                    backdropFilter: "blur(8px)",
                   }}
-                  labelStyle={{ color: "#0A0A0A", fontSize: "10px", fontWeight: "700", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: "4px" }}
+                  labelStyle={{
+                    color: "var(--pluto-600)",
+                    fontSize: "10px",
+                    fontWeight: "700",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                    marginBottom: "8px",
+                  }}
                   formatter={(value: number, name: string) => [
                     <span key={name} className="flex items-center gap-2">
-                       <span className="text-[11px] font-bold text-[#0A0A0A]">{value.toLocaleString()}</span>
-                       <span className="text-[9px] font-medium text-[#6B6B6B] uppercase">{name}</span>
+                      <span className="text-[12px] font-bold text-[var(--text-primary)]">
+                        {value.toLocaleString()}
+                      </span>
+                      <span className="text-[10px] font-medium text-[var(--text-secondary)] uppercase tracking-widest">
+                        {name}
+                      </span>
                     </span>,
                     null,
                   ]}
@@ -599,7 +513,7 @@ export default function PaymentMetrics({
                       isAnimationActive
                       animationDuration={400}
                     />
-                  )
+                  ),
                 )}
                 {assets.map((asset, index) =>
                   hiddenAssets.has(asset) ? null : (
@@ -617,13 +531,14 @@ export default function PaymentMetrics({
                       animationDuration={400}
                       connectNulls
                     />
-                  )
+                  ),
                 )}
               </LineChart>
             </ResponsiveContainer>
-          </div>
+            </div>
+          </>
         )}
-      </div>
+      </section>
     </div>
   );
 }

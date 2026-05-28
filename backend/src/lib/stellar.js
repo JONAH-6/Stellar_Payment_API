@@ -11,6 +11,9 @@ const HORIZON_URL = (
 
 const server = new StellarSdk.Horizon.Server(HORIZON_URL);
 const HORIZON_HEALTH_TIMEOUT_MS = 2_000;
+const HORIZON_RETRY_DELAYS_MS = [150, 500];
+const STELLAR_PUBLIC_KEY_PATTERN = /^G[A-Z2-7]{55}$/;
+const ASSET_CODE_PATTERN = /^[A-Z0-9]{1,12}$/;
 
 function parseStroops(value) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -19,6 +22,84 @@ function parseStroops(value) {
 
 function stroopsToXlm(stroops) {
   return (stroops / 10_000_000).toFixed(7);
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getHorizonStatus(err) {
+  return err?.response?.status ?? err?.status ?? null;
+}
+
+function isRetryableHorizonError(err) {
+  const status = getHorizonStatus(err);
+  if (status === 408 || status === 429) {
+    return true;
+  }
+
+  if (typeof status === "number" && status >= 500) {
+    return true;
+  }
+
+  const code = String(err?.code || "").toUpperCase();
+  if (
+    [
+      "ECONNABORTED",
+      "ECONNREFUSED",
+      "ECONNRESET",
+      "ENETUNREACH",
+      "EHOSTUNREACH",
+      "ETIMEDOUT",
+      "UND_ERR_CONNECT_TIMEOUT",
+      "UND_ERR_SOCKET",
+    ].includes(code)
+  ) {
+    return true;
+  }
+
+  if (err?.name === "AbortError") {
+    return true;
+  }
+
+  return /timeout|temporar|network|socket|fetch failed/i.test(
+    String(err?.message || ""),
+  );
+}
+
+async function withHorizonRetry(operation, context = "") {
+  let lastError = null;
+
+  for (let attempt = 0; attempt <= HORIZON_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      return await operation();
+    } catch (err) {
+      lastError = err;
+      if (!isRetryableHorizonError(err) || attempt === HORIZON_RETRY_DELAYS_MS.length) {
+        throw handleHorizonError(err, context);
+      }
+
+      await sleep(HORIZON_RETRY_DELAYS_MS[attempt]);
+    }
+  }
+
+  throw handleHorizonError(lastError, context);
+}
+
+export function isValidStellarAccountId(value) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    return false;
+  }
+
+  return StellarSdk.StrKey.isValidEd25519PublicKey(value.trim());
+}
+
+export function isValidAssetCode(value) {
+  if (typeof value !== "string") {
+    return false;
+  }
+
+  return /^[A-Z0-9]{1,12}$/.test(value.trim().toUpperCase());
 }
 
 /**
@@ -136,11 +217,23 @@ export async function isHorizonReachable() {
 }
 
 export function resolveAsset(assetCode, assetIssuer) {
-  if (!assetCode) {
+  const normalizedAssetCode = String(assetCode || "").trim().toUpperCase();
+
+  if (!normalizedAssetCode) {
     throw new Error("Asset code is required");
   }
 
-  if (assetCode.toUpperCase() === "XLM") {
+  const normalizedCode = assetCode.toUpperCase();
+  if (!isValidAssetCode(normalizedCode)) {
+    throw new Error("Asset code must be 1-12 uppercase alphanumeric characters");
+  }
+
+  if (normalizedCode === "XLM") {
+  if (!ASSET_CODE_PATTERN.test(normalizedAssetCode)) {
+    throw new Error("Asset code must be 1-12 alphanumeric characters");
+  }
+
+  if (normalizedAssetCode === "XLM") {
     return StellarSdk.Asset.native();
   }
 
@@ -148,7 +241,41 @@ export function resolveAsset(assetCode, assetIssuer) {
     throw new Error("Asset issuer is required for non-native assets");
   }
 
-  return new StellarSdk.Asset(assetCode.toUpperCase(), assetIssuer);
+  if (!isValidStellarAccountId(assetIssuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key");
+  }
+
+  return new StellarSdk.Asset(normalizedCode, assetIssuer);
+  const normalizedAssetIssuer = String(assetIssuer).trim();
+
+  if (!isValidStellarPublicKey(normalizedAssetIssuer)) {
+    throw new Error("Asset issuer must be a valid Stellar public key");
+  }
+
+  return new StellarSdk.Asset(normalizedAssetCode, normalizedAssetIssuer);
+}
+
+export function isValidStellarPublicKey(value) {
+  const publicKey = String(value || "").trim();
+
+  if (!STELLAR_PUBLIC_KEY_PATTERN.test(publicKey)) {
+    return false;
+  }
+
+  if (typeof StellarSdk.StrKey?.isValidEd25519PublicKey === "function") {
+    return StellarSdk.StrKey.isValidEd25519PublicKey(publicKey);
+  }
+
+  if (typeof StellarSdk.Keypair?.fromPublicKey === "function") {
+    try {
+      StellarSdk.Keypair.fromPublicKey(publicKey);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function amountsMatch(expected, received) {
@@ -191,7 +318,7 @@ function paymentMatchesAsset(payment, asset) {
 
   return (
     String(payment.asset_code || "").toUpperCase() ===
-      String(expectedCode || "").toUpperCase() &&
+    String(expectedCode || "").toUpperCase() &&
     String(payment.asset_issuer || "") === String(expectedIssuer || "")
   );
 }
@@ -300,9 +427,20 @@ export async function findStrictReceivePaths({
   const sourceAsset = resolveAsset(sourceAssetCode, sourceAssetIssuer);
 
   try {
-    const result = await server
-      .strictReceivePaths([sourceAsset], destAsset, destAmount)
-      .call();
+    if (sourceAccount) {
+      await withHorizonRetry(
+        () => server.loadAccount(sourceAccount),
+        `source account ${sourceAccount}`,
+      );
+    }
+
+    const result = await withHorizonRetry(
+      () =>
+        server
+          .strictReceivePaths([sourceAsset], destAsset, destAmount)
+          .call(),
+      "strict-receive-paths",
+    );
 
     if (!result.records || result.records.length === 0) {
       return null;
@@ -310,6 +448,13 @@ export async function findStrictReceivePaths({
 
     // Return the best (first) path
     const best = result.records[0];
+    const sourceAmount = Number(best.source_amount);
+    if (!Number.isFinite(sourceAmount) || sourceAmount <= 0) {
+      const error = new Error("Horizon returned an invalid path payment quote");
+      error.status = 502;
+      throw error;
+    }
+
     return {
       source_amount: best.source_amount,
       source_asset_code:
@@ -322,6 +467,9 @@ export async function findStrictReceivePaths({
       })),
     };
   } catch (err) {
+    if (err?.status) {
+      throw err;
+    }
     throw handleHorizonError(err, "strict-receive-paths");
   }
 }
@@ -340,14 +488,18 @@ export async function findMatchingPayment({
 
   let page;
   try {
-    page = await server
-      .payments()
-      .forAccount(recipient)
-      .order("desc")
-      .limit(200)
-      .call();
+    page = await withHorizonRetry(
+      () =>
+        server
+          .payments()
+          .forAccount(recipient)
+          .order("desc")
+          .limit(200)
+          .call(),
+      recipient,
+    );
   } catch (err) {
-    throw handleHorizonError(err, recipient);
+    throw err?.status ? err : handleHorizonError(err, recipient);
   }
 
   // Check if recipient is multi-sig for enhanced verification
@@ -384,10 +536,14 @@ export async function findMatchingPayment({
     // If a memo is expected, fetch the parent transaction and compare
     if (memo != null && memo !== "") {
       try {
-        const tx = await server
-          .transactions()
-          .transaction(payment.transaction_hash)
-          .call();
+        const tx = await withHorizonRetry(
+          () =>
+            server
+              .transactions()
+              .transaction(payment.transaction_hash)
+              .call(),
+          `transaction ${payment.transaction_hash}`,
+        );
 
         if (!memoMatches(tx, memo, memoType)) {
           continue;
@@ -429,7 +585,10 @@ export async function findAnyRecentPayment({
 
   let page;
   try {
-    page = await server.payments().forAccount(recipient).order("desc").limit(100).call();
+    page = await withHorizonRetry(
+      () => server.payments().forAccount(recipient).order("desc").limit(100).call(),
+      recipient,
+    );
   } catch {
     return null;
   }
@@ -533,9 +692,191 @@ export async function getNetworkFeeStats(operationCount = 1) {
   }
 }
 
-export function getStellarConfig() {
+export async function getStellarConfig() {
   return {
     network: NETWORK,
     horizonUrl: HORIZON_URL,
+  };
+}
+
+/**
+ * Result object returned by verifyTransactionSignature.
+ * @typedef {Object} SignatureVerificationResult
+ * @property {boolean} valid          - Whether the transaction passes all checks.
+ * @property {string}  reason         - Human-readable explanation of the result.
+ * @property {boolean} isMultiSig     - Whether the source account uses multi-sig.
+ * @property {number}  signatureCount - Number of signatures present in the envelope.
+ * @property {boolean} thresholdMet   - Whether the signing weight meets the medium threshold.
+ */
+
+/**
+ * Performs full cryptographic signature verification for a Stellar transaction.
+ *
+ * Verification steps:
+ *  1. Fetch the transaction envelope from Horizon.
+ *  2. Deserialise the XDR envelope and confirm at least one signature is present.
+ *  3. Load the source account to obtain its current signer list and thresholds.
+ *  4. For each signature in the envelope, derive the signer's public key via
+ *     Ed25519 key-recovery and check it against the account's authorised signers.
+ *  5. Accumulate signing weight and verify it meets the account's medium threshold
+ *     (used for payment operations).
+ *
+ * Falls back gracefully: if the account cannot be loaded (e.g. Horizon is
+ * temporarily unavailable) the function returns `valid: false` rather than
+ * throwing, so the Ledger Monitor can skip the payment safely.
+ *
+ * @param {string} txHash - The transaction hash to verify.
+ * @returns {Promise<SignatureVerificationResult>}
+ */
+export async function verifyTransactionSignature(txHash) {
+  if (!txHash || typeof txHash !== "string") {
+    return {
+      valid: false,
+      reason: "Invalid transaction hash provided",
+      isMultiSig: false,
+      signatureCount: 0,
+      thresholdMet: false,
+    };
+  }
+
+  const passphrase =
+    NETWORK === "public"
+      ? StellarSdk.Networks.PUBLIC
+      : StellarSdk.Networks.TESTNET;
+
+  // ── Step 1: Fetch transaction envelope from Horizon ──────────────────────
+  let tx;
+  try {
+    tx = await withHorizonRetry(
+      () => server.transactions().transaction(txHash).call(),
+      `transaction ${txHash}`,
+    );
+  } catch (err) {
+    const wrapped = err?.status ? err : handleHorizonError(err, `transaction ${txHash}`);
+    console.error(`verifyTransactionSignature: failed to fetch tx ${txHash}: ${wrapped.message}`);
+    return {
+      valid: false,
+      reason: `Failed to fetch transaction from Horizon: ${wrapped.message}`,
+      isMultiSig: false,
+      signatureCount: 0,
+      thresholdMet: false,
+    };
+  }
+
+  // ── Step 2: Deserialise XDR envelope ─────────────────────────────────────
+  let transaction;
+  try {
+    transaction = new StellarSdk.Transaction(tx.envelope_xdr, passphrase);
+  } catch (err) {
+    console.error(`verifyTransactionSignature: failed to parse XDR for tx ${txHash}: ${err.message}`);
+    return {
+      valid: false,
+      reason: `Failed to parse transaction XDR: ${err.message}`,
+      isMultiSig: false,
+      signatureCount: 0,
+      thresholdMet: false,
+    };
+  }
+
+  const signatures = transaction.signatures;
+  if (!signatures || signatures.length === 0) {
+    return {
+      valid: false,
+      reason: "Transaction envelope contains no signatures",
+      isMultiSig: false,
+      signatureCount: 0,
+      thresholdMet: false,
+    };
+  }
+
+  // ── Step 3: Load source account signers & thresholds ─────────────────────
+  const sourceAccountId = transaction.source;
+  let accountData;
+  try {
+    accountData = await withHorizonRetry(
+      () => server.loadAccount(sourceAccountId),
+      `source account ${sourceAccountId}`,
+    );
+  } catch (err) {
+    // Non-fatal: if we cannot load the account we cannot verify weights.
+    // Return valid=false so the caller can decide whether to skip or retry.
+    console.warn(`verifyTransactionSignature: could not load account ${sourceAccountId}: ${err.message}`);
+    return {
+      valid: false,
+      reason: `Could not load source account for weight verification: ${err.message}`,
+      isMultiSig: false,
+      signatureCount: signatures.length,
+      thresholdMet: false,
+    };
+  }
+
+  const signers = accountData.signers ?? [];
+  const medThreshold = accountData.thresholds?.med_threshold ?? 0;
+  const isMultiSig = signers.length > 1 || medThreshold > 1;
+
+  // Build a lookup map: publicKey → weight for O(1) access
+  const signerWeightMap = new Map(
+    signers.map((s) => [s.key, s.weight])
+  );
+
+  // ── Step 4: Verify each signature cryptographically ──────────────────────
+  // The transaction hash is the payload that was signed.
+  const txHashBytes = transaction.hash();
+
+  let totalWeight = 0;
+  let validSignatureCount = 0;
+  const usedSigners = new Set(); // Prevent signature replay
+
+  for (const decoratedSig of signatures) {
+    // hint is the last 4 bytes of the public key — use it to narrow candidates
+    const hint = decoratedSig.hint();
+    const sigBytes = decoratedSig.signature();
+
+    for (const [publicKey, weight] of signerWeightMap) {
+      if (usedSigners.has(publicKey)) continue;
+
+      // Quick hint check before expensive crypto
+      const keyPair = StellarSdk.Keypair.fromPublicKey(publicKey);
+      const keyHint = keyPair.signatureHint();
+
+      if (!hint.equals(keyHint)) continue;
+
+      // Full Ed25519 signature verification
+      try {
+        const isValid = keyPair.verify(txHashBytes, sigBytes);
+        if (isValid) {
+          totalWeight += weight;
+          validSignatureCount += 1;
+          usedSigners.add(publicKey);
+          break; // move to next signature
+        }
+      } catch {
+        // Malformed signature bytes — skip
+      }
+    }
+  }
+
+  // ── Step 5: Check medium threshold ───────────────────────────────────────
+  // Payment operations require medium threshold authorisation.
+  // A threshold of 0 means any single valid signature suffices.
+  const effectiveThreshold = medThreshold > 0 ? medThreshold : 1;
+  const thresholdMet = totalWeight >= effectiveThreshold;
+
+  if (!thresholdMet) {
+    return {
+      valid: false,
+      reason: `Insufficient signing weight: accumulated ${totalWeight}, required ${effectiveThreshold} (medium threshold)`,
+      isMultiSig,
+      signatureCount: signatures.length,
+      thresholdMet: false,
+    };
+  }
+
+  return {
+    valid: true,
+    reason: `Signature verification passed: weight ${totalWeight} >= threshold ${effectiveThreshold}`,
+    isMultiSig,
+    signatureCount: signatures.length,
+    thresholdMet: true,
   };
 }

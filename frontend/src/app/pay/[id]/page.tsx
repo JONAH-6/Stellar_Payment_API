@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
 import Image from "next/image";
 import { useParams, useRouter } from "next/navigation";
 import { useLocale, useTranslations } from "next-intl";
@@ -9,6 +10,10 @@ import { Spinner } from "@/components/ui/Spinner";
 import { usePayment } from "@/lib/usePayment";
 import { useAssetMetadata } from "@/lib/useAssetMetadata";
 import { getAccountBalances, type AssetBalance } from "@/lib/stellar";
+import {
+  didWalletAccountSwitch,
+  sortSupportedAssetsByBalance,
+} from "@/lib/checkout-balance-sync";
 import { createReceiptPdf } from "@/lib/receipt-pdf";
 import CheckoutQrModal from "@/components/CheckoutQrModal";
 import CopyButton from "@/components/CopyButton";
@@ -18,7 +23,7 @@ import Skeleton, { SkeletonTheme } from "react-loading-skeleton";
 import "react-loading-skeleton/dist/skeleton.css";
 import { QRCodeSVG } from "qrcode.react";
 import { localeToLanguageTag } from "@/i18n/config";
-import Confetti from "react-confetti";
+import { PaymentSuccessAnimation } from "@/components/PaymentSuccessAnimation";
 import { useCheckoutPresence } from "@/lib/useCheckoutPresence";
 import { Modal } from "@/components/ui/Modal";
 
@@ -155,7 +160,7 @@ export default function PaymentPage() {
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [showQrModal, setShowQrModal] = useState(false);
-  const [showConfetti, setShowConfetti] = useState(false);
+  const [isOptimisticSuccess, setIsOptimisticSuccess] = useState(false);
   const [isDownloadingReceipt, setIsDownloadingReceipt] = useState(false);
   const [isPayModalOpen, setIsPayModalOpen] = useState(false);
   const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
@@ -178,7 +183,12 @@ export default function PaymentPage() {
   const activeViewers = useCheckoutPresence(paymentId);
 
   useEffect(() => {
-    if (payment && (payment.status === "confirmed" || payment.status === "completed")) setShowConfetti(true);
+    if (payment && (payment.status === "confirmed" || payment.status === "completed")) {
+      setIsOptimisticSuccess(true);
+      // Auto-hide the big celebration after 4 seconds to show the receipt/details
+      const timer = setTimeout(() => setIsOptimisticSuccess(false), 4000);
+      return () => clearTimeout(timer);
+    }
   }, [payment]);
 
   useEffect(() => {
@@ -257,8 +267,11 @@ export default function PaymentPage() {
 
   useEffect(() => {
     if (!walletPublicKey) return;
-    if (previousWalletPublicKey.current && previousWalletPublicKey.current !== walletPublicKey) {
-      toast.info("Wallet account switched. Checkout balances updated.");
+    if (didWalletAccountSwitch(previousWalletPublicKey.current, walletPublicKey)) {
+      // Optimistic update: clear balances immediately when wallet switches
+      setWalletBalances([]);
+      setSortedSourceAssets([]);
+      toast.info("Wallet account switched. Updating balances...");
     }
     previousWalletPublicKey.current = walletPublicKey;
   }, [walletPublicKey]);
@@ -271,7 +284,7 @@ export default function PaymentPage() {
         const balances = await getAccountBalances(walletPublicKey, horizonUrl);
         setWalletBalances(balances);
         const supported = assetMetadata.map(a => a.code);
-        const sorted = [...supported].sort((a, b) => parseFloat(balances.find(x => x.code === b)?.balance || "0") - parseFloat(balances.find(x => x.code === a)?.balance || "0"));
+        const sorted = sortSupportedAssetsByBalance(supported, balances);
         setSortedSourceAssets(sorted);
         if (sorted.length > 0) setSourceAsset(sorted[0]);
       } catch { }
@@ -325,9 +338,13 @@ export default function PaymentPage() {
       } else {
         result = await processPayment({ recipient: payment.recipient, amount: String(payment.amount), assetCode: payment.asset, assetIssuer: payment.asset_issuer, memo: payment.memo, memoType: payment.memo_type });
       }
+      // Optimistic update: trigger animation and local state as soon as transaction hash is available
+      setIsOptimisticSuccess(true);
       setPayment({ ...payment, status: "completed", tx_id: result.hash });
       toast.success(t("paymentSent"));
-      setTimeout(async () => { try { await fetch(`${API_URL}/api/verify-payment/${paymentId}`, { method: "POST" }); } catch { } }, 2000);
+      
+      // Verification in background
+      void fetch(`${API_URL}/api/verify-payment/${paymentId}`, { method: "POST" }).catch(() => {});
     } catch {
       const msg = paymentError ?? t("paymentFailed");
       setActionError(msg); toast.error(msg);
@@ -372,17 +389,44 @@ export default function PaymentPage() {
 
   return (
     <>
-      {showConfetti && <div className="pointer-events-none fixed inset-0 z-50"><Confetti recycle={false} numberOfPieces={350} /></div>}
+      <PaymentSuccessAnimation
+        show={isOptimisticSuccess}
+        onComplete={() => setIsOptimisticSuccess(false)}
+        amount={payment?.amount != null ? String(payment.amount) : undefined}
+        asset={payment?.asset}
+        txId={payment?.tx_id ?? undefined}
+        isOptimistic={payment?.status !== "confirmed" && payment?.status !== "completed"}
+      />
 
-      {isProcessing && (
-        <div className="fixed inset-0 z-50 flex flex-col items-center justify-center gap-4 bg-white/95 backdrop-blur-sm">
-          <Spinner size="xl" />
-          <div className="flex flex-col items-center gap-1 text-center">
-            <p className="text-sm font-bold text-[#0A0A0A]">{txStatus ?? t("processingFallback")}</p>
-            <p className="text-xs text-[#6B6B6B]">{t("doNotClose")}</p>
-          </div>
-        </div>
-      )}
+      <AnimatePresence>
+        {isProcessing && !isOptimisticSuccess && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[60] flex flex-col items-center justify-center gap-6 bg-white/95 backdrop-blur-xl"
+          >
+            <div className="relative">
+              <motion.div 
+                className="absolute inset-0 rounded-full bg-[var(--pluto-100)] opacity-20"
+                animate={{ scale: [1, 1.5, 1], opacity: [0.1, 0.3, 0.1] }}
+                transition={{ duration: 2, repeat: Infinity, ease: "easeInOut" }}
+              />
+              <Spinner size="xl" className="text-[var(--pluto-500)]" />
+            </div>
+            <div className="flex flex-col items-center gap-2 text-center px-6">
+              <motion.p 
+                initial={{ opacity: 0, y: 5 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="text-base font-bold text-[var(--pluto-900)] tracking-tight"
+              >
+                {txStatus ?? t("processingFallback")}
+              </motion.p>
+              <p className="text-xs font-medium text-[var(--pluto-400)] uppercase tracking-widest">{t("doNotClose")}</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <main className="h-screen bg-white overflow-hidden flex items-center justify-center px-4">
         <div className="w-full max-w-sm flex flex-col h-full max-h-screen py-6 gap-4">
@@ -495,21 +539,59 @@ export default function PaymentPage() {
                       <p className="text-center text-[10px] text-[#6B6B6B] font-medium">{t("connectedVia", { provider: activeProvider.name ?? "" })}</p>
 
                       {sortedSourceAssets.length > 0 && (
-                        <div className="flex flex-col gap-1.5">
-                          <label className="text-[10px] font-bold uppercase tracking-widest text-[#6B6B6B]">Payment Asset</label>
-                          <div className="relative">
-                            <select value={sourceAsset} onChange={(e) => setSourceAsset(e.target.value)}
-                              className="w-full appearance-none rounded-xl border border-[#E8E8E8] bg-[#F9F9F9] px-4 py-3 text-sm font-medium text-[#0A0A0A] focus:border-[#0A0A0A] focus:outline-none transition-colors">
-                              {sortedSourceAssets.map(code => (
-                                <option key={code} value={code}>{code} — {parseFloat(walletBalances.find(b => b.code === code)?.balance || "0").toFixed(2)}</option>
-                              ))}
-                            </select>
-                            <div className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#6B6B6B]">
-                              <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-                            </div>
-                          </div>
+                    <div
+                      className="flex flex-col gap-1.5"
+                      aria-live="polite"
+                      aria-atomic="true"
+                    >
+                      <label
+                        htmlFor="source-asset-select"
+                        className="text-[10px] font-bold uppercase tracking-widest text-[#6B6B6B]"
+                      >
+                        Payment Asset
+                      </label>
+
+                      <motion.div
+                        className="relative"
+                        key={walletBalances.length} // Re-animate when balances update
+                        initial={{ opacity: 0, y: 10 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ duration: 0.3, ease: [0.16, 1, 0.3, 1] }}
+                      >
+                        <select
+                          id="source-asset-select"
+                          value={sourceAsset}
+                          onChange={(e) => setSourceAsset(e.target.value)}
+                          className="w-full appearance-none rounded-xl border border-[#E8E8E8] bg-[#F9F9F9] px-4 py-3 text-sm font-medium text-[#0A0A0A] focus:border-[#0A0A0A] focus:outline-none transition-colors"
+                          aria-label="Select payment asset and view available balances"
+                        >
+                          {sortedSourceAssets.map(code => (
+                            <option key={code} value={code}>
+                              {code} — {parseFloat(walletBalances.find(b => b.code === code)?.balance || "0").toFixed(2)}
+                            </option>
+                          ))}
+                        </select>
+
+                        <div
+                          className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-[#6B6B6B]"
+                          aria-hidden="true"
+                        >
+                          <svg
+                            className="h-4 w-4"
+                            fill="none"
+                            stroke="currentColor"
+                            viewBox="0 0 24 24"
+                          >
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={2}
+                              d="M19 9l-7 7-7-7"
+                            />
+                          </svg>
                         </div>
-                      )}
+                      </motion.div>
+                    </div>
 
                       {pathQuoteLoading && <p className="text-center text-xs text-[#6B6B6B]">Checking payment routes…</p>}
                       {pathQuoteError && <p className="text-center text-xs text-red-500">{pathQuoteError}</p>}
@@ -547,13 +629,19 @@ export default function PaymentPage() {
 
               {isSettled && (
                 <div className="flex flex-col gap-3">
-                  <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5 text-center flex flex-col items-center gap-2">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-emerald-100">
-                      <svg className="h-5 w-5 text-emerald-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
+                  <motion.div 
+                    initial={{ opacity: 0, y: 10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="rounded-2xl border border-[var(--pluto-200)] bg-[var(--pluto-50)] p-6 text-center flex flex-col items-center gap-3 shadow-inner"
+                  >
+                    <div className="flex h-12 w-12 items-center justify-center rounded-full bg-white shadow-sm border border-[var(--pluto-100)]">
+                      <svg className="h-6 w-6 text-[var(--pluto-500)]" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" /></svg>
                     </div>
-                    <p className="text-sm font-bold text-emerald-800">{t("receivedTitle")}</p>
-                    <p className="text-xs text-emerald-600">{t("receivedDescription")}</p>
-                  </div>
+                    <div className="space-y-1">
+                      <p className="text-base font-bold text-[var(--pluto-800)]">{t("receivedTitle")}</p>
+                      <p className="text-xs font-medium text-[var(--pluto-500)]">{t("receivedDescription")}</p>
+                    </div>
+                  </motion.div>
                   <button type="button" onClick={handleDownloadReceipt} disabled={isDownloadingReceipt}
                     className="flex h-12 w-full items-center justify-center gap-2 rounded-xl border border-[#E8E8E8] bg-white text-sm font-bold text-[#0A0A0A] hover:bg-[#F5F5F5] disabled:opacity-50 transition-all">
                     <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
@@ -621,3 +709,5 @@ export default function PaymentPage() {
     </>
   );
 }
+
+
