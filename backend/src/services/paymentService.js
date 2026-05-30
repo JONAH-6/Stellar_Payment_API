@@ -19,6 +19,7 @@ import {
   invalidatePaymentCache,
 } from "../lib/redis.js";
 import { resolveAssetIssuer } from "../constants/assetConstants.js";
+import { AssetIssuerErrorRecovery } from "../lib/asset-issuer.js";
 import {
   paymentCreatedCounter,
   paymentConfirmedCounter,
@@ -475,6 +476,27 @@ export const paymentService = {
       const error = new Error("asset_issuer must be a valid Stellar public key");
       error.status = 400;
       throw error;
+    }
+
+    // Task #756: Dynamic Issuer Verification with Error Recovery
+    if (asset !== "XLM" && assetIssuer) {
+      try {
+        const issuerExists = await AssetIssuerErrorRecovery.verifyIssuerOnChain(assetIssuer);
+        if (!issuerExists) {
+          const error = new Error(`Asset issuer ${assetIssuer} does not exist on the Stellar network`);
+          error.status = 400;
+          throw error;
+        }
+      } catch (recoveryError) {
+        console.error("Asset issuer verification failed with recovery:", recoveryError);
+        // If it's a transient failure we might still want to proceed or fail-safe?
+        // Let's fail-safe for security if it's not a 404 but a real error
+        if (recoveryError.status !== 404) {
+          // Re-throw if it wasn't a "not found" but something else that recovery failed to handle
+          // after max retries/circuit breaker
+          throw recoveryError;
+        }
+      }
     }
 
     // Per-asset payment limit validation

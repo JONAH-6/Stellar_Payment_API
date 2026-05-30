@@ -32,7 +32,13 @@ export function resolveAssetIssuer(assetCode, assetIssuer, network = process.env
     return assetIssuer.trim();
   }
 
-  return getDefaultAssetIssuer(asset, network);
+  const issuer = getDefaultAssetIssuer(asset, network);
+  if (issuer) {
+    console.log(`Resolved default asset issuer for ${assetCode}: ${issuer}`);
+  } else {
+    console.warn(`Could not resolve asset issuer for ${assetCode}`);
+  }
+  return issuer;
 }
 
 export function getPossibleAssets() {
