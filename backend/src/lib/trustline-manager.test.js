@@ -72,7 +72,7 @@ import {
   isValidAssetCode 
 } from './stellar.js';
 import * as StellarSdk from 'stellar-sdk';
-import rateLimit from 'express-rate-limit';
+import _rateLimit from 'express-rate-limit';
 
 describe('Trustline Manager - Task #595: Cryptographic Signature Verification', () => {
   let verifier;
@@ -291,100 +291,350 @@ describe('Trustline Manager - Task #594: Rate Limiting', () => {
   });
 });
 
-describe('Trustline Manager - Task #597: Error Recovery', () => {
+describe('Trustline Manager - Task #746: Enhanced Error Recovery', () => {
   beforeEach(() => {
-    // Reset circuit breaker state
+    // Reset ALL per-context circuit breakers and drain the DLQ
     TrustlineErrorRecovery.resetCircuitBreaker();
+    TrustlineErrorRecovery.drainDeadLetterQueue();
     vi.clearAllMocks();
   });
 
-  describe('TrustlineErrorRecovery', () => {
+  describe('TrustlineErrorRecovery – basic execution', () => {
     test('should execute operation successfully on first try', async () => {
       const mockOperation = vi.fn().mockResolvedValue('success');
-      
       const result = await TrustlineErrorRecovery.executeWithRecovery(mockOperation);
-      
       expect(result).toBe('success');
       expect(mockOperation).toHaveBeenCalledTimes(1);
     });
 
     test('should retry on retryable errors', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
       const mockOperation = vi.fn()
         .mockRejectedValueOnce(new Error('network timeout'))
         .mockRejectedValueOnce(new Error('connection refused'))
         .mockResolvedValue('success');
-      
+
       const result = await TrustlineErrorRecovery.executeWithRecovery(mockOperation);
-      
       expect(result).toBe('success');
       expect(mockOperation).toHaveBeenCalledTimes(3);
+
+      vi.restoreAllMocks();
     });
 
     test('should not retry on non-retryable errors', async () => {
       const error = new Error('asset not found');
       error.status = 404;
       const mockOperation = vi.fn().mockRejectedValue(error);
-      
+
       await expect(
-        TrustlineErrorRecovery.executeWithRecovery(mockOperation)
+        TrustlineErrorRecovery.executeWithRecovery(mockOperation),
       ).rejects.toThrow('asset not found');
-      
+
       expect(mockOperation).toHaveBeenCalledTimes(1);
     });
+  });
 
-    test('should classify network errors as retryable', () => {
+  describe('TrustlineErrorRecovery – error classification', () => {
+    test('should classify network errors as retryable with high priority', () => {
       const networkError = new Error('network timeout');
-      const classification = TrustlineErrorRecovery.classifyError(networkError);
-      
-      expect(classification.type).toBe('network');
-      expect(classification.retryable).toBe(true);
-      expect(classification.priority).toBe('high');
+      const c = TrustlineErrorRecovery.classifyError(networkError);
+      expect(c.type).toBe('network');
+      expect(c.retryable).toBe(true);
+      expect(c.priority).toBe('high');
     });
 
-    test('should classify rate limit errors as retryable with low priority', () => {
-      const rateLimitError = new Error('rate limit exceeded');
-      rateLimitError.status = 429;
-      const classification = TrustlineErrorRecovery.classifyError(rateLimitError);
-      
-      expect(classification.type).toBe('rate_limit');
-      expect(classification.retryable).toBe(true);
-      expect(classification.priority).toBe('low');
+    test('should classify timeout errors (isTimeout flag) as retryable', () => {
+      const err = new Error('operation timed out after 15000ms');
+      err.isTimeout = true;
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('timeout');
+      expect(c.retryable).toBe(true);
     });
 
-    test('should classify client errors as non-retryable', () => {
-      const clientError = new Error('bad request');
-      clientError.status = 400;
-      const classification = TrustlineErrorRecovery.classifyError(clientError);
-      
-      expect(classification.type).toBe('client_error');
-      expect(classification.retryable).toBe(false);
+    test('should classify rate limit errors (HTTP 429) as retryable with low priority', () => {
+      const err = new Error('rate limit exceeded');
+      err.status = 429;
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('rate_limit');
+      expect(c.retryable).toBe(true);
+      expect(c.priority).toBe('low');
     });
 
-    test('should open circuit breaker after threshold failures', async () => {
+    test('should classify HTTP 401 as auth_error (non-retryable)', () => {
+      const err = new Error('unauthorized');
+      err.status = 401;
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('auth_error');
+      expect(c.retryable).toBe(false);
+    });
+
+    test('should classify HTTP 403 as auth_error (non-retryable)', () => {
+      const err = new Error('forbidden');
+      err.status = 403;
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('auth_error');
+      expect(c.retryable).toBe(false);
+    });
+
+    test('should classify client errors (4xx) as non-retryable', () => {
+      const err = new Error('bad request');
+      err.status = 400;
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('client_error');
+      expect(c.retryable).toBe(false);
+    });
+
+    test('should classify 5xx server errors as retryable', () => {
+      const err = new Error('internal server error');
+      err.status = 500;
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('server_error');
+      expect(c.retryable).toBe(true);
+    });
+
+    test('should classify db schema conflict as non-retryable', () => {
+      const err = new Error('index already exists');
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('db_schema_conflict');
+      expect(c.retryable).toBe(false);
+    });
+
+    test('should classify unknown errors as cautiously retryable', () => {
+      const err = new Error('something weird happened');
+      const c = TrustlineErrorRecovery.classifyError(err);
+      expect(c.type).toBe('unknown');
+      expect(c.retryable).toBe(true);
+    });
+  });
+
+  describe('TrustlineErrorRecovery – per-context circuit breakers', () => {
+    test('should open circuit breaker after threshold failures on a context', async () => {
       vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
-      const mockOperation = vi.fn().mockRejectedValue(new Error('server error'));
-      
-      // Trigger multiple failures to open circuit breaker
+      const ctx = 'test-context-cb';
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      // Each call exhausts MAX_RETRY_ATTEMPTS, recording one failure per call
       for (let i = 0; i < 5; i++) {
-        await expect(TrustlineErrorRecovery.executeWithRecovery(mockOperation)).rejects.toThrow();
+        await expect(
+          TrustlineErrorRecovery.executeWithRecovery(failingOp, ctx),
+        ).rejects.toThrow();
       }
-      
-      // Circuit breaker should now be open
+
       await expect(
-        TrustlineErrorRecovery.executeWithRecovery(mockOperation)
+        TrustlineErrorRecovery.executeWithRecovery(failingOp, ctx),
       ).rejects.toThrow('Circuit breaker is open');
 
       vi.restoreAllMocks();
     });
 
-    test('should calculate retry delay with exponential backoff', () => {
-      const delay1 = TrustlineErrorRecovery.calculateRetryDelay(1, 'high');
-      const delay2 = TrustlineErrorRecovery.calculateRetryDelay(2, 'high');
-      const delay3 = TrustlineErrorRecovery.calculateRetryDelay(3, 'high');
-      
-      expect(delay2).toBeGreaterThan(delay1);
-      expect(delay3).toBeGreaterThan(delay2);
-      expect(delay3).toBeLessThanOrEqual(30000); // Capped at 30 seconds
+    test('should isolate circuit breakers per context', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      // Open the circuit for context A
+      for (let i = 0; i < 5; i++) {
+        await expect(
+          TrustlineErrorRecovery.executeWithRecovery(failingOp, 'context-A'),
+        ).rejects.toThrow();
+      }
+
+      // Context B should still be operational
+      const successOp = vi.fn().mockResolvedValue('ok');
+      const result = await TrustlineErrorRecovery.executeWithRecovery(successOp, 'context-B');
+      expect(result).toBe('ok');
+
+      vi.restoreAllMocks();
+    });
+
+    test('isCircuitBreakerOpen returns false when breaker is closed', () => {
+      expect(TrustlineErrorRecovery.isCircuitBreakerOpen('fresh-context')).toBe(false);
+    });
+
+    test('resetCircuitBreaker(context) clears only that context', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      for (let i = 0; i < 5; i++) {
+        await expect(
+          TrustlineErrorRecovery.executeWithRecovery(failingOp, 'ctx-reset'),
+        ).rejects.toThrow();
+      }
+
+      expect(TrustlineErrorRecovery.isCircuitBreakerOpen('ctx-reset')).toBe(true);
+      TrustlineErrorRecovery.resetCircuitBreaker('ctx-reset');
+      expect(TrustlineErrorRecovery.isCircuitBreakerOpen('ctx-reset')).toBe(false);
+
+      vi.restoreAllMocks();
+    });
+
+    test('getCircuitBreakerMetrics returns state snapshots', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      await expect(
+        TrustlineErrorRecovery.executeWithRecovery(failingOp, 'metrics-ctx'),
+      ).rejects.toThrow();
+
+      const metrics = TrustlineErrorRecovery.getCircuitBreakerMetrics();
+      expect(metrics['metrics-ctx']).toBeDefined();
+      expect(metrics['metrics-ctx'].metrics.totalFailures).toBeGreaterThan(0);
+
+      vi.restoreAllMocks();
+    });
+  });
+
+  describe('TrustlineErrorRecovery – half-open circuit breaker', () => {
+    test('should allow a probe after timeout and close on success', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const ctx = 'half-open-ctx';
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      // Force open
+      for (let i = 0; i < 5; i++) {
+        await expect(
+          TrustlineErrorRecovery.executeWithRecovery(failingOp, ctx),
+        ).rejects.toThrow();
+      }
+
+      // Manually advance the state to half-open by mutating internal state
+      const state = TrustlineErrorRecovery._getState(ctx);
+      state.state = 'half-open';
+
+      const successOp = vi.fn().mockResolvedValue('recovered');
+      const result = await TrustlineErrorRecovery.executeWithRecovery(successOp, ctx);
+      expect(result).toBe('recovered');
+      expect(state.state).toBe('closed');
+
+      vi.restoreAllMocks();
+    });
+
+    test('should reopen circuit if half-open probe fails', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const ctx = 'half-open-fail-ctx';
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      for (let i = 0; i < 5; i++) {
+        await expect(
+          TrustlineErrorRecovery.executeWithRecovery(failingOp, ctx),
+        ).rejects.toThrow();
+      }
+
+      const state = TrustlineErrorRecovery._getState(ctx);
+      state.state = 'half-open';
+
+      await expect(
+        TrustlineErrorRecovery.executeWithRecovery(failingOp, ctx),
+      ).rejects.toThrow();
+
+      expect(state.state).toBe('open');
+
+      vi.restoreAllMocks();
+    });
+  });
+
+  describe('TrustlineErrorRecovery – operation timeout', () => {
+    test('withTimeout rejects after the specified delay', async () => {
+      const neverResolves = new Promise(() => {});
+      await expect(
+        TrustlineErrorRecovery.withTimeout(neverResolves, 50, 'slow op'),
+      ).rejects.toThrow('slow op timed out after 50ms');
+    });
+
+    test('withTimeout resolves if operation completes in time', async () => {
+      const fast = Promise.resolve('quick');
+      await expect(
+        TrustlineErrorRecovery.withTimeout(fast, 1000, 'fast op'),
+      ).resolves.toBe('quick');
+    });
+  });
+
+  describe('TrustlineErrorRecovery – dead-letter queue', () => {
+    test('should push non-retryable failures to the DLQ', async () => {
+      const err = new Error('asset not found');
+      err.status = 404;
+      const failingOp = vi.fn().mockRejectedValue(err);
+
+      await expect(
+        TrustlineErrorRecovery.executeWithRecovery(failingOp, 'dlq-ctx'),
+      ).rejects.toThrow();
+
+      const dlq = TrustlineErrorRecovery.getDeadLetterQueue();
+      expect(dlq.length).toBeGreaterThan(0);
+      expect(dlq[0].context).toBe('dlq-ctx');
+      expect(dlq[0].errorType).toBe('asset_not_found');
+    });
+
+    test('drainDeadLetterQueue returns all entries and empties the queue', async () => {
+      const err = new Error('asset not found');
+      err.status = 404;
+      const failingOp = vi.fn().mockRejectedValue(err);
+      await expect(
+        TrustlineErrorRecovery.executeWithRecovery(failingOp, 'drain-ctx'),
+      ).rejects.toThrow();
+
+      const drained = TrustlineErrorRecovery.drainDeadLetterQueue();
+      expect(drained.length).toBeGreaterThan(0);
+      expect(TrustlineErrorRecovery.getDeadLetterQueue()).toHaveLength(0);
+    });
+  });
+
+  describe('TrustlineErrorRecovery – fallback handler', () => {
+    test('should return fallback value when all attempts fail', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const err = new Error('network error');
+      const failingOp = vi.fn().mockRejectedValue(err);
+      const fallback = vi.fn().mockResolvedValue('cached-data');
+
+      const result = await TrustlineErrorRecovery.executeWithRecovery(
+        failingOp,
+        'fallback-ctx',
+        { fallback },
+      );
+
+      expect(result).toBe('cached-data');
+      expect(fallback).toHaveBeenCalledTimes(1);
+
+      vi.restoreAllMocks();
+    });
+
+    test('should return fallback value when circuit breaker is open', async () => {
+      vi.spyOn(TrustlineErrorRecovery, 'sleep').mockResolvedValue(undefined);
+      const ctx = 'cb-fallback-ctx';
+      const failingOp = vi.fn().mockRejectedValue(new Error('server error'));
+
+      for (let i = 0; i < 5; i++) {
+        await expect(
+          TrustlineErrorRecovery.executeWithRecovery(failingOp, ctx),
+        ).rejects.toThrow();
+      }
+
+      const fallback = vi.fn().mockResolvedValue('degraded-response');
+      const result = await TrustlineErrorRecovery.executeWithRecovery(
+        failingOp,
+        ctx,
+        { fallback },
+      );
+
+      expect(result).toBe('degraded-response');
+      expect(fallback).toHaveBeenCalledTimes(1);
+
+      vi.restoreAllMocks();
+    });
+  });
+
+  describe('TrustlineErrorRecovery – retry delay', () => {
+    test('should produce strictly increasing delays with exponential backoff', () => {
+      // Use a fixed seed by mocking Math.random to return 0 (no jitter)
+      vi.spyOn(Math, 'random').mockReturnValue(0.5); // jitter = 0
+      const d1 = TrustlineErrorRecovery.calculateRetryDelay(1, 'high');
+      const d2 = TrustlineErrorRecovery.calculateRetryDelay(2, 'high');
+      const d3 = TrustlineErrorRecovery.calculateRetryDelay(3, 'high');
+
+      expect(d2).toBeGreaterThan(d1);
+      expect(d3).toBeGreaterThan(d2);
+      expect(d3).toBeLessThanOrEqual(30000);
+
+      vi.restoreAllMocks();
     });
   });
 });

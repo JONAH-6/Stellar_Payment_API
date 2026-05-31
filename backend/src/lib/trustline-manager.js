@@ -1,25 +1,25 @@
 /**
  * Trustline Manager - Enhanced cryptographic verification, rate limiting, error recovery, and optimized queries
- * 
+ *
  * This module provides comprehensive trustline management functionality with:
  * - Task #595: Cryptographic signature verification for trustline operations
  * - Task #594: Rate limiting for trustline operations
- * - Task #597: Enhanced error recovery mechanisms
+ * - Task #746: Enhanced error recovery mechanisms
  * - Task #596: Optimized SQL queries for trustline data
  */
 
 import { createHash } from "node:crypto";
 import * as StellarSdk from "stellar-sdk";
 import { queryWithRetry } from "./db.js";
-import { 
-  isValidStellarAccountId, 
+import {
+  isValidStellarAccountId,
   verifyTransactionSignature,
   withHorizonRetry,
-  isValidAssetCode 
+  isValidAssetCode,
 } from "./stellar.js";
-import { 
+import {
   createRedisRateLimitStore,
-  RATE_LIMIT_REDIS_PREFIX 
+  RATE_LIMIT_REDIS_PREFIX,
 } from "./rate-limit.js";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 
@@ -33,13 +33,24 @@ const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_DELAY_BASE_MS = 1000;
 const CIRCUIT_BREAKER_THRESHOLD = 5;
 const CIRCUIT_BREAKER_TIMEOUT_MS = 30 * 1000;
+const CIRCUIT_BREAKER_HALF_OPEN_PROBE_MS = 5 * 1000; // time before allowing probe in half-open
+const OPERATION_TIMEOUT_MS = 15 * 1000; // default per-operation timeout
+const DLQ_MAX_SIZE = 100; // maximum dead-letter queue entries
 
-// Circuit breaker state
-let circuitBreakerState = {
-  failures: 0,
-  lastFailureTime: null,
-  isOpen: false
-};
+/**
+ * Per-context circuit breaker states.
+ * Key: context string (or 'default'). Value: CircuitBreakerState.
+ *
+ * Using a Map keeps failure domains isolated so a surge in one operation
+ * (e.g. Horizon calls) does not block unrelated DB queries.
+ */
+const circuitBreakerRegistry = new Map();
+
+/**
+ * In-memory dead-letter queue for failed operations that exhausted retries.
+ * Entries are available for inspection, replay, or external alerting.
+ */
+const deadLetterQueue = [];
 
 /**
  * Task #595: Enhanced cryptographic signature verification for trustline operations
@@ -274,7 +285,7 @@ export class TrustlineRateLimiter {
       legacyHeaders: false,
       validate: { ip: false },
       keyGenerator: this.getTrustlineOperationKey,
-      requestWasSuccessful: (req, res) => res.statusCode < 400,
+      requestWasSuccessful: (_req, res) => res.statusCode < 400,
       store,
       passOnStoreError: true,
       // Skip rate limiting for high-tier merchants
@@ -300,7 +311,7 @@ export class TrustlineRateLimiter {
       legacyHeaders: false,
       validate: { ip: false },
       keyGenerator: this.getTrustlineVerificationKey,
-      requestWasSuccessful: (req, res) => res.statusCode < 400,
+      requestWasSuccessful: (_req, res) => res.statusCode < 400,
       store,
       passOnStoreError: true
     });
@@ -308,62 +319,263 @@ export class TrustlineRateLimiter {
 }
 
 /**
- * Task #597: Enhanced error recovery for trustline operations
- * 
- * Implements robust error recovery mechanisms:
- * - Exponential backoff retry logic
- * - Circuit breaker pattern
- * - Graceful degradation
- * - Comprehensive error classification
+ * Task #746: Enhanced error recovery for trustline operations
+ *
+ * Improvements over the previous implementation:
+ * - Per-context circuit breakers (failure domains are isolated)
+ * - Half-open state: one probe attempt before fully closing the breaker
+ * - Operation timeout wrapper (prevents runaway async calls)
+ * - Dead-letter queue for unrecoverable failures (replay / alerting)
+ * - Error metrics per context (failure counts, last error, recovery counts)
+ * - Pluggable fallback handlers so callers can return cached/degraded data
+ * - Comprehensive error classification unchanged but extended for auth errors
  */
 export class TrustlineErrorRecovery {
-  
+
+  // ─── Circuit Breaker Helpers ────────────────────────────────────────────────
+
+  static _getState(context) {
+    if (!circuitBreakerRegistry.has(context)) {
+      circuitBreakerRegistry.set(context, {
+        failures: 0,
+        lastFailureTime: null,
+        // States: 'closed' | 'open' | 'half-open'
+        state: 'closed',
+        successAfterHalfOpen: 0,
+        metrics: {
+          totalFailures: 0,
+          totalRecoveries: 0,
+          lastErrorMessage: null,
+          lastErrorTime: null,
+        },
+      });
+    }
+    return circuitBreakerRegistry.get(context);
+  }
+
   /**
-   * Execute operation with enhanced error recovery
+   * Returns the circuit breaker disposition for a given context.
+   * 'allow'     – proceed normally
+   * 'probe'     – one probe allowed (half-open state)
+   * 'reject'    – circuit open, reject immediately
    */
-  static async executeWithRecovery(operation, context = "trustline operation") {
-    // Check circuit breaker
-    if (this.isCircuitBreakerOpen()) {
-      throw new Error(`Circuit breaker is open for ${context}. Service temporarily unavailable.`);
+  static _circuitBreakerDisposition(context) {
+    const s = this._getState(context);
+    const now = Date.now();
+
+    if (s.state === 'closed') return 'allow';
+
+    if (s.state === 'open') {
+      const elapsed = now - s.lastFailureTime;
+      if (elapsed >= CIRCUIT_BREAKER_TIMEOUT_MS) {
+        // Transition to half-open: allow a single probe
+        s.state = 'half-open';
+        s.successAfterHalfOpen = 0;
+        return 'probe';
+      }
+      // Still within the open window
+      if (elapsed >= CIRCUIT_BREAKER_HALF_OPEN_PROBE_MS && s.state === 'open') {
+        return 'reject';
+      }
+      return 'reject';
     }
 
+    // half-open: allow probe only once
+    if (s.state === 'half-open') return 'probe';
+
+    return 'allow';
+  }
+
+  static _recordFailure(context, error) {
+    const s = this._getState(context);
+    s.failures++;
+    s.lastFailureTime = Date.now();
+    s.metrics.totalFailures++;
+    s.metrics.lastErrorMessage = error?.message ?? String(error);
+    s.metrics.lastErrorTime = new Date().toISOString();
+
+    if (s.state === 'half-open') {
+      // Probe failed – reopen the circuit
+      s.state = 'open';
+    } else if (s.failures >= CIRCUIT_BREAKER_THRESHOLD) {
+      s.state = 'open';
+    }
+  }
+
+  static _recordSuccess(context) {
+    const s = this._getState(context);
+    if (s.state === 'half-open') {
+      // Probe succeeded – close the circuit
+      s.state = 'closed';
+      s.failures = 0;
+      s.metrics.totalRecoveries++;
+    } else {
+      s.failures = 0;
+      s.metrics.totalRecoveries++;
+    }
+  }
+
+  // ─── Dead-Letter Queue ───────────────────────────────────────────────────────
+
+  static _pushToDeadLetterQueue(entry) {
+    if (deadLetterQueue.length >= DLQ_MAX_SIZE) {
+      deadLetterQueue.shift(); // evict oldest
+    }
+    deadLetterQueue.push({
+      ...entry,
+      enqueuedAt: new Date().toISOString(),
+    });
+  }
+
+  /** Returns a shallow copy of the dead-letter queue for inspection. */
+  static getDeadLetterQueue() {
+    return [...deadLetterQueue];
+  }
+
+  /** Drain (clear) the dead-letter queue and return its contents. */
+  static drainDeadLetterQueue() {
+    return deadLetterQueue.splice(0, deadLetterQueue.length);
+  }
+
+  // ─── Timeout Wrapper ─────────────────────────────────────────────────────────
+
+  /**
+   * Wraps a promise with a hard timeout.
+   * Rejects with a timeout error if the operation takes longer than `ms`.
+   */
+  static withTimeout(promise, ms = OPERATION_TIMEOUT_MS, label = 'operation') {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        const err = new Error(`${label} timed out after ${ms}ms`);
+        err.isTimeout = true;
+        reject(err);
+      }, ms);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+  }
+
+  // ─── Core Execution ──────────────────────────────────────────────────────────
+
+  /**
+   * Execute operation with enhanced error recovery.
+   *
+   * Options:
+   *   timeoutMs    – hard timeout per attempt (default: OPERATION_TIMEOUT_MS)
+   *   fallback     – async fn() called when all attempts fail; its return value
+   *                  is returned instead of throwing (graceful degradation)
+   *   maxAttempts  – override MAX_RETRY_ATTEMPTS for this call
+   */
+  static async executeWithRecovery(
+    operation,
+    context = 'trustline operation',
+    { timeoutMs = OPERATION_TIMEOUT_MS, fallback = null, maxAttempts = MAX_RETRY_ATTEMPTS } = {},
+  ) {
+    const disposition = this._circuitBreakerDisposition(context);
+
+    if (disposition === 'reject') {
+      const cbError = new Error(
+        `Circuit breaker is open for "${context}". Service temporarily unavailable.`,
+      );
+      cbError.isCircuitBreakerOpen = true;
+      cbError.status = 503;
+
+      if (fallback) {
+        try {
+          return await fallback(cbError);
+        } catch (_) { /* fall through to throw */ }
+      }
+      throw cbError;
+    }
+
+    // Half-open probes run exactly once (maxAttempts=1, no retry)
+    const effectiveMaxAttempts = disposition === 'probe' ? 1 : maxAttempts;
+
     let lastError = null;
-    
-    for (let attempt = 1; attempt <= MAX_RETRY_ATTEMPTS; attempt++) {
+
+    for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt++) {
       try {
-        const result = await operation();
-        
-        // Reset circuit breaker on success
-        this.resetCircuitBreaker();
-        
+        const result = await this.withTimeout(
+          Promise.resolve().then(() => operation()),
+          timeoutMs,
+          context,
+        );
+
+        this._recordSuccess(context);
         return result;
       } catch (error) {
         lastError = error;
-        
-        // Classify error to determine if retry is appropriate
+
         const errorClass = this.classifyError(error);
-        
-        if (!errorClass.retryable || attempt === MAX_RETRY_ATTEMPTS) {
-          this.recordFailure();
-          throw this.enhanceError(error, context, attempt, errorClass);
+
+        if (!errorClass.retryable || attempt === effectiveMaxAttempts) {
+          this._recordFailure(context, error);
+          const enhanced = this.enhanceError(error, context, attempt, errorClass);
+
+          // Push to dead-letter queue for non-retryable terminal failures
+          if (!errorClass.retryable) {
+            this._pushToDeadLetterQueue({
+              context,
+              errorType: errorClass.type,
+              errorMessage: error.message,
+              attempts: attempt,
+            });
+          }
+
+          if (fallback) {
+            try {
+              return await fallback(enhanced);
+            } catch (_) { /* fall through to throw */ }
+          }
+          throw enhanced;
         }
 
-        // Calculate delay with exponential backoff and jitter
         const delay = this.calculateRetryDelay(attempt, errorClass.priority);
         await this.sleep(delay);
       }
     }
 
-    this.recordFailure();
-    throw this.enhanceError(lastError, context, MAX_RETRY_ATTEMPTS, this.classifyError(lastError));
+    this._recordFailure(context, lastError);
+    const finalEnhanced = this.enhanceError(
+      lastError,
+      context,
+      effectiveMaxAttempts,
+      this.classifyError(lastError),
+    );
+
+    this._pushToDeadLetterQueue({
+      context,
+      errorType: this.classifyError(lastError).type,
+      errorMessage: lastError?.message,
+      attempts: effectiveMaxAttempts,
+    });
+
+    if (fallback) {
+      try {
+        return await fallback(finalEnhanced);
+      } catch (_) { /* fall through to throw */ }
+    }
+    throw finalEnhanced;
   }
 
+  // ─── Error Classification ─────────────────────────────────────────────────
+
   /**
-   * Classify errors for appropriate recovery strategy
+   * Classify errors for appropriate recovery strategy.
    */
   static classifyError(error) {
     const message = error.message?.toLowerCase() || '';
     const status = error.status || error.response?.status;
+
+    // Timeout errors - retryable
+    if (error.isTimeout || message.includes('timed out')) {
+      return {
+        type: 'timeout',
+        retryable: true,
+        priority: 'high',
+        reason: 'Operation timed out',
+      };
+    }
 
     // Database schema errors - not retryable
     if (message.includes('index already exists') || message.includes('relation already exists')) {
@@ -371,7 +583,7 @@ export class TrustlineErrorRecovery {
         type: 'db_schema_conflict',
         retryable: false,
         priority: 'none',
-        reason: 'Database schema conflict, such as an index already existing.'
+        reason: 'Database schema conflict, such as an index already existing.',
       };
     }
 
@@ -389,7 +601,7 @@ export class TrustlineErrorRecovery {
         type: 'network',
         retryable: true,
         priority: 'high',
-        reason: 'Network connectivity issue'
+        reason: 'Network connectivity issue',
       };
     }
 
@@ -399,17 +611,27 @@ export class TrustlineErrorRecovery {
         type: 'rate_limit',
         retryable: true,
         priority: 'low',
-        reason: 'Rate limit exceeded'
+        reason: 'Rate limit exceeded',
+      };
+    }
+
+    // Authentication/authorization errors - not retryable
+    if (status === 401 || status === 403) {
+      return {
+        type: 'auth_error',
+        retryable: false,
+        priority: 'none',
+        reason: 'Authentication or authorization failure',
       };
     }
 
     // Horizon server errors - retryable
-    if (status >= 500 && status < 600) {
+    if (typeof status === 'number' && status >= 500 && status < 600) {
       return {
         type: 'server_error',
         retryable: true,
         priority: 'medium',
-        reason: 'Server error'
+        reason: 'Server error',
       };
     }
 
@@ -421,7 +643,7 @@ export class TrustlineErrorRecovery {
           type: 'asset_not_found',
           retryable: false,
           priority: 'none',
-          reason: 'Asset or account not found'
+          reason: 'Asset or account not found',
         };
       }
 
@@ -431,18 +653,18 @@ export class TrustlineErrorRecovery {
           type: 'insufficient_balance',
           retryable: false,
           priority: 'none',
-          reason: 'Insufficient balance for operation'
+          reason: 'Insufficient balance for operation',
         };
       }
     }
 
     // Client errors (4xx) - generally not retryable
-    if (status >= 400 && status < 500) {
+    if (typeof status === 'number' && status >= 400 && status < 500) {
       return {
         type: 'client_error',
         retryable: false,
         priority: 'none',
-        reason: 'Client error - check request parameters'
+        reason: 'Client error - check request parameters',
       };
     }
 
@@ -451,78 +673,83 @@ export class TrustlineErrorRecovery {
       type: 'unknown',
       retryable: true,
       priority: 'low',
-      reason: 'Unknown error type'
+      reason: 'Unknown error type',
     };
   }
 
-  /**
-   * Calculate retry delay with exponential backoff
-   */
-  static calculateRetryDelay(attempt, priority = 'medium') {
-    const baseDelay = RETRY_DELAY_BASE_MS;
-    const multiplier = priority === 'high' ? 1 : priority === 'low' ? 3 : 2;
-    const exponentialDelay = baseDelay * Math.pow(2, attempt - 1) * multiplier;
-    
-    // Add jitter (±25%)
-    const jitter = exponentialDelay * 0.25 * (Math.random() - 0.5);
-    
-    return Math.min(exponentialDelay + jitter, 30000); // Cap at 30 seconds
-  }
+  // ─── Retry Delay ─────────────────────────────────────────────────────────────
 
   /**
-   * Enhanced error with recovery context
+   * Calculate retry delay with exponential backoff and ±25 % jitter.
    */
+  static calculateRetryDelay(attempt, priority = 'medium') {
+    const multiplier = priority === 'high' ? 1 : priority === 'low' ? 3 : 2;
+    const exponentialDelay = RETRY_DELAY_BASE_MS * Math.pow(2, attempt - 1) * multiplier;
+    const jitter = exponentialDelay * 0.25 * (Math.random() - 0.5);
+    return Math.min(exponentialDelay + jitter, 30000); // cap at 30 s
+  }
+
+  // ─── Error Enhancement ────────────────────────────────────────────────────────
+
   static enhanceError(originalError, context, attempts, errorClass) {
     const enhanced = new Error(
-      `${context} failed after ${attempts} attempts: ${originalError.message} (${errorClass.reason})`
+      `${context} failed after ${attempts} attempt${attempts !== 1 ? 's' : ''}: ${originalError.message} (${errorClass.reason})`,
     );
-    
     enhanced.originalError = originalError;
     enhanced.context = context;
     enhanced.attempts = attempts;
     enhanced.errorClass = errorClass;
     enhanced.status = originalError.status || 500;
     enhanced.recoverable = errorClass.retryable;
-    
     return enhanced;
   }
 
+  // ─── Public Circuit-Breaker API ───────────────────────────────────────────────
+
   /**
-   * Circuit breaker management
+   * Returns true when the circuit breaker for `context` is open (backwards compat).
+   * Pass no argument to check the legacy global context ('default').
    */
-  static isCircuitBreakerOpen() {
-    if (!circuitBreakerState.isOpen) {
-      return false;
-    }
-
-    // Check if timeout has passed
-    const now = Date.now();
-    if (now - circuitBreakerState.lastFailureTime > CIRCUIT_BREAKER_TIMEOUT_MS) {
-      circuitBreakerState.isOpen = false;
-      circuitBreakerState.failures = 0;
-      return false;
-    }
-
-    return true;
+  static isCircuitBreakerOpen(context = 'default') {
+    return this._circuitBreakerDisposition(context) === 'reject';
   }
 
+  /**
+   * Manually reset the circuit breaker for a given context.
+   * Useful in tests and administrative endpoints.
+   */
+  static resetCircuitBreaker(context = null) {
+    if (context) {
+      circuitBreakerRegistry.delete(context);
+    } else {
+      // Legacy behaviour: reset all breakers
+      circuitBreakerRegistry.clear();
+    }
+  }
+
+  /** Return a snapshot of all circuit breaker states (for health endpoints). */
+  static getCircuitBreakerMetrics() {
+    const snapshot = {};
+    for (const [ctx, state] of circuitBreakerRegistry.entries()) {
+      snapshot[ctx] = {
+        state: state.state,
+        failures: state.failures,
+        lastFailureTime: state.lastFailureTime,
+        metrics: { ...state.metrics },
+      };
+    }
+    return snapshot;
+  }
+
+  // ─── Compat / Helpers ─────────────────────────────────────────────────────────
+
+  /** Legacy compatibility: record a failure on the default context. */
   static recordFailure() {
-    circuitBreakerState.failures++;
-    circuitBreakerState.lastFailureTime = Date.now();
-    
-    if (circuitBreakerState.failures >= CIRCUIT_BREAKER_THRESHOLD) {
-      circuitBreakerState.isOpen = true;
-    }
+    this._recordFailure('default', null);
   }
 
-  static resetCircuitBreaker() {
-    circuitBreakerState.failures = 0;
-    circuitBreakerState.isOpen = false;
-    circuitBreakerState.lastFailureTime = null;
-  }
-
-  static sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+  static async sleep(ms) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 }
 
