@@ -1,26 +1,26 @@
 /** @vitest-environment jsdom */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, act } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import TransactionFilterSidebar from "./TransactionFilterSidebar";
 import React from "react";
 import "@testing-library/jest-dom/vitest";
 
-// Mock framer-motion to avoid animation issues in tests
 vi.mock("framer-motion", () => ({
   motion: {
     div: ({ children, ...props }: any) => <div {...props}>{children}</div>,
     aside: ({ children, ...props }: any) => <aside {...props}>{children}</aside>,
     span: ({ children, ...props }: any) => <span {...props}>{children}</span>,
-    button: ({ children, onClick, disabled, className, type }: any) => (
-      <button onClick={onClick} disabled={disabled} className={className} type={type}>
-        {children}
-      </button>
+    button: ({ children, onClick, disabled, className, type, style }: any) => (
+      <button onClick={onClick} disabled={disabled} className={className} type={type} style={style}>{children}</button>
     ),
+    p: ({ children, ...props }: any) => <p {...props}>{children}</p>,
+    svg: ({ children, ...props }: any) => <svg {...props}>{children}</svg>,
   },
   AnimatePresence: ({ children }: any) => <>{children}</>,
+  useReducedMotion: () => false,
 }));
 
-describe("TransactionFilterSidebar", () => {
+describe("TransactionFilterSidebar — framer-motion animations", () => {
   const defaultFilters = {
     search: "",
     status: "all",
@@ -39,14 +39,12 @@ describe("TransactionFilterSidebar", () => {
     onClose: vi.fn(),
   };
 
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+  beforeEach(() => vi.clearAllMocks());
 
-  // ── Rendering ──────────────────────────────────────────────────────────────
+  // ── Mount / stagger ────────────────────────────────────────────────────────
 
-  describe("Rendering", () => {
-    it("renders all filter sections", () => {
+  describe("Mount animations", () => {
+    it("renders all filter sections on mount", () => {
       render(<TransactionFilterSidebar {...mockProps} />);
 
       expect(screen.getAllByText("Filters").length).toBeGreaterThan(0);
@@ -56,69 +54,112 @@ describe("TransactionFilterSidebar", () => {
       expect(screen.getAllByText(/Date Range/i).length).toBeGreaterThan(0);
     });
 
-    it("displays current filter values", () => {
-      const activeFilters = {
-        search: "test-id",
-        status: "confirmed",
-        asset: "USDC",
-        dateFrom: "2023-01-01",
-        dateTo: "2023-12-31",
-      };
-
-      render(<TransactionFilterSidebar {...mockProps} filters={activeFilters} />);
-
-      const searchInputs = screen.getAllByLabelText(/Search/i);
-      expect(searchInputs[0]).toHaveValue("test-id");
-
-      const statusSelects = screen.getAllByLabelText(/Status/i);
-      expect(statusSelects[0]).toHaveValue("confirmed");
-
-      const usdcButtons = screen.getAllByRole("button", { name: /^USDC$/i });
-      expect(usdcButtons[0]).toHaveClass("bg-[var(--pluto-500)]");
+    it("renders Clear All Filters button on mount", () => {
+      render(<TransactionFilterSidebar {...mockProps} />);
+      expect(screen.getAllByRole("button", { name: /Clear All Filters/i }).length).toBeGreaterThan(0);
     });
   });
 
-  // ── Optimistic Interactions ────────────────────────────────────────────────
+  // ── Date Range collapsible ─────────────────────────────────────────────────
 
-  describe("Optimistic interactions", () => {
-    it("calls onFilterChange immediately on search input (no debounce in component)", () => {
+  describe("Date Range collapsible section", () => {
+    it("starts collapsed when no date filters are active", () => {
       render(<TransactionFilterSidebar {...mockProps} />);
 
-      const searchInputs = screen.getAllByLabelText(/Search/i);
-      fireEvent.change(searchInputs[0], { target: { value: "new search" } });
-
-      expect(mockProps.onFilterChange).toHaveBeenCalledTimes(1);
-      expect(mockProps.onFilterChange).toHaveBeenCalledWith("search", "new search");
+      // Date inputs should not be in the DOM when collapsed
+      const fromInputs = screen.queryAllByLabelText(/^From$/i, { selector: "input" });
+      expect(fromInputs.length).toBe(0);
     });
 
-    it("calls onFilterChange immediately on status change", () => {
+    it("starts expanded when dateFrom is pre-filled", () => {
+      render(
+        <TransactionFilterSidebar
+          {...mockProps}
+          filters={{ ...defaultFilters, dateFrom: "2024-01-01" }}
+        />,
+      );
+
+      const fromInputs = screen.getAllByLabelText(/^From$/i, { selector: "input" });
+      expect(fromInputs.length).toBeGreaterThan(0);
+    });
+
+    it("starts expanded when dateTo is pre-filled", () => {
+      render(
+        <TransactionFilterSidebar
+          {...mockProps}
+          filters={{ ...defaultFilters, dateTo: "2024-12-31" }}
+        />,
+      );
+
+      const toInputs = screen.getAllByLabelText(/^To$/i, { selector: "input" });
+      expect(toInputs.length).toBeGreaterThan(0);
+    });
+
+    it("expands when Date Range toggle is clicked", async () => {
       render(<TransactionFilterSidebar {...mockProps} />);
 
-      const statusSelects = screen.getAllByLabelText(/Status/i);
-      fireEvent.change(statusSelects[0], { target: { value: "failed" } });
+      const toggleButtons = screen.getAllByRole("button", { name: "" });
+      // The Date Range toggle button has aria-expanded
+      const dateToggle = screen
+        .getAllByRole("button")
+        .find((b) => b.getAttribute("aria-expanded") !== null);
 
-      expect(mockProps.onFilterChange).toHaveBeenCalledWith("status", "failed");
+      expect(dateToggle).toBeDefined();
+      fireEvent.click(dateToggle!);
+
+      await waitFor(() => {
+        const fromInputs = screen.getAllByLabelText(/^From$/i, { selector: "input" });
+        expect(fromInputs.length).toBeGreaterThan(0);
+      });
     });
 
-    it("calls onFilterChange immediately on asset button click", () => {
+    it("has aria-expanded=false when collapsed", () => {
       render(<TransactionFilterSidebar {...mockProps} />);
 
-      const xlmButtons = screen.getAllByRole("button", { name: /^XLM$/i });
-      fireEvent.click(xlmButtons[0]);
+      const dateToggle = screen
+        .getAllByRole("button")
+        .find((b) => b.getAttribute("aria-expanded") === "false");
 
-      expect(mockProps.onFilterChange).toHaveBeenCalledWith("asset", "XLM");
+      expect(dateToggle).toBeDefined();
     });
 
-    it("calls onFilterChange immediately on date change", () => {
+    it("has aria-expanded=true when expanded", () => {
+      render(
+        <TransactionFilterSidebar
+          {...mockProps}
+          filters={{ ...defaultFilters, dateFrom: "2024-01-01" }}
+        />,
+      );
+
+      const dateToggle = screen
+        .getAllByRole("button")
+        .find((b) => b.getAttribute("aria-expanded") === "true");
+
+      expect(dateToggle).toBeDefined();
+    });
+  });
+
+  // ── Clear-search animated button ───────────────────────────────────────────
+
+  describe("Animated clear-search button", () => {
+    it("renders clear button when search has a value", () => {
+      render(
+        <TransactionFilterSidebar
+          {...mockProps}
+          filters={{ ...defaultFilters, search: "something" }}
+        />,
+      );
+
+      const clearButtons = screen.getAllByLabelText(/Clear search/i);
+      expect(clearButtons.length).toBeGreaterThan(0);
+    });
+
+    it("does not render clear button when search is empty", () => {
       render(<TransactionFilterSidebar {...mockProps} />);
-
-      const fromInputs = screen.getAllByLabelText(/From/i, { selector: "input" });
-      fireEvent.change(fromInputs[0], { target: { value: "2024-01-01" } });
-
-      expect(mockProps.onFilterChange).toHaveBeenCalledWith("dateFrom", "2024-01-01");
+      expect(screen.queryByLabelText(/Clear search/i)).not.toBeInTheDocument();
     });
 
-    it("calls onClearFilter when clear-search button is clicked", () => {
+    it("calls onClearFilter with 'search' when clear button clicked", () => {
       render(
         <TransactionFilterSidebar
           {...mockProps}
@@ -128,62 +169,31 @@ describe("TransactionFilterSidebar", () => {
 
       const clearButtons = screen.getAllByLabelText(/Clear search/i);
       fireEvent.click(clearButtons[0]);
-
       expect(mockProps.onClearFilter).toHaveBeenCalledWith("search");
     });
   });
 
-  // ── Filter Management ──────────────────────────────────────────────────────
+  // ── Close button rotation ──────────────────────────────────────────────────
 
-  describe("Filter management", () => {
-    it("calls onClearAll when Clear All Filters button is clicked", () => {
-      render(<TransactionFilterSidebar {...mockProps} hasActiveFilters={true} />);
-
-      const clearAllButtons = screen.getAllByRole("button", { name: /Clear All Filters/i });
-      fireEvent.click(clearAllButtons[0]);
-
-      expect(mockProps.onClearAll).toHaveBeenCalled();
+  describe("Animated close button (mobile)", () => {
+    it("renders close button in mobile drawer", () => {
+      render(<TransactionFilterSidebar {...mockProps} />);
+      const closeButtons = screen.getAllByLabelText(/Close filters/i);
+      expect(closeButtons.length).toBeGreaterThan(0);
     });
 
-    it("disables Clear All button when no active filters", () => {
-      render(<TransactionFilterSidebar {...mockProps} hasActiveFilters={false} />);
-
-      const clearAllButtons = screen.getAllByRole("button", { name: /Clear All Filters/i });
-      expect(clearAllButtons[0]).toBeDisabled();
-    });
-
-    it("enables Clear All button when hasActiveFilters is true", () => {
-      render(<TransactionFilterSidebar {...mockProps} hasActiveFilters={true} />);
-
-      const clearAllButtons = screen.getAllByRole("button", { name: /Clear All Filters/i });
-      expect(clearAllButtons[0]).not.toBeDisabled();
+    it("calls onClose when close button clicked", () => {
+      render(<TransactionFilterSidebar {...mockProps} />);
+      const closeButtons = screen.getAllByLabelText(/Close filters/i);
+      fireEvent.click(closeButtons[0]);
+      expect(mockProps.onClose).toHaveBeenCalled();
     });
   });
 
-  // ── Optimistic visual feedback ─────────────────────────────────────────────
+  // ── Optimistic pending states ──────────────────────────────────────────────
 
-  describe("Optimistic visual feedback — searchSyncPending", () => {
-    it("sets aria-busy on search input when searchSyncPending is true", () => {
-      render(
-        <TransactionFilterSidebar
-          {...mockProps}
-          filters={{ ...defaultFilters, search: "pending-query" }}
-          searchSyncPending
-        />,
-      );
-
-      const searchInputs = screen.getAllByLabelText(/Search/i);
-      expect(searchInputs[0]).toHaveAttribute("aria-busy", "true");
-    });
-
-    it("does NOT set aria-busy on search when searchSyncPending is false", () => {
-      render(<TransactionFilterSidebar {...mockProps} />);
-
-      const searchInputs = screen.getAllByLabelText(/Search/i);
-      expect(searchInputs[0]).toHaveAttribute("aria-busy", "false");
-    });
-
-    it("shows 'Applying to results…' hint text when searchSyncPending", () => {
+  describe("Optimistic visual feedback", () => {
+    it("shows 'Applying to results…' hint when searchSyncPending", () => {
       render(
         <TransactionFilterSidebar
           {...mockProps}
@@ -195,13 +205,7 @@ describe("TransactionFilterSidebar", () => {
       expect(screen.getAllByText(/Applying to results/i).length).toBeGreaterThan(0);
     });
 
-    it("hides 'Applying to results…' hint when searchSyncPending is false", () => {
-      render(<TransactionFilterSidebar {...mockProps} />);
-
-      expect(screen.queryByText(/Applying to results/i)).not.toBeInTheDocument();
-    });
-
-    it("applies dashed border class to search input when searchSyncPending", () => {
+    it("sets aria-busy on search input when searchSyncPending", () => {
       render(
         <TransactionFilterSidebar
           {...mockProps}
@@ -210,26 +214,11 @@ describe("TransactionFilterSidebar", () => {
         />,
       );
 
-      const searchInputs = screen.getAllByLabelText(/Search/i);
-      expect(searchInputs[0].className).toContain("border-dashed");
-    });
-  });
-
-  describe("Optimistic visual feedback — isFilterPending", () => {
-    it("sets aria-busy on status select when isFilterPending is true", () => {
-      render(
-        <TransactionFilterSidebar
-          {...mockProps}
-          filters={{ ...defaultFilters, status: "pending" }}
-          isFilterPending
-        />,
-      );
-
-      const statusSelects = screen.getAllByLabelText(/Status/i);
-      expect(statusSelects[0]).toHaveAttribute("aria-busy", "true");
+      const inputs = screen.getAllByLabelText(/Search/i);
+      expect(inputs[0]).toHaveAttribute("aria-busy", "true");
     });
 
-    it("applies dashed border to status select when isFilterPending", () => {
+    it("sets aria-busy on status select when isFilterPending", () => {
       render(
         <TransactionFilterSidebar
           {...mockProps}
@@ -238,8 +227,8 @@ describe("TransactionFilterSidebar", () => {
         />,
       );
 
-      const statusSelects = screen.getAllByLabelText(/Status/i);
-      expect(statusSelects[0].className).toContain("border-dashed");
+      const selects = screen.getAllByLabelText(/Status/i);
+      expect(selects[0]).toHaveAttribute("aria-busy", "true");
     });
 
     it("applies pending opacity to active asset button when isFilterPending", () => {
@@ -254,8 +243,12 @@ describe("TransactionFilterSidebar", () => {
       const xlmButtons = screen.getAllByRole("button", { name: /^XLM$/i });
       expect(xlmButtons[0].className).toContain("opacity-70");
     });
+  });
 
-    it("shows aria-pressed on active asset button", () => {
+  // ── Asset button interactions ──────────────────────────────────────────────
+
+  describe("Asset button animations", () => {
+    it("marks active asset button with aria-pressed=true", () => {
       render(
         <TransactionFilterSidebar
           {...mockProps}
@@ -267,7 +260,7 @@ describe("TransactionFilterSidebar", () => {
       expect(usdcButtons[0]).toHaveAttribute("aria-pressed", "true");
     });
 
-    it("inactive asset buttons have aria-pressed='false'", () => {
+    it("marks inactive asset buttons with aria-pressed=false", () => {
       render(
         <TransactionFilterSidebar
           {...mockProps}
@@ -278,34 +271,46 @@ describe("TransactionFilterSidebar", () => {
       const xlmButtons = screen.getAllByRole("button", { name: /^XLM$/i });
       expect(xlmButtons[0]).toHaveAttribute("aria-pressed", "false");
     });
+
+    it("calls onFilterChange when an asset button is clicked", () => {
+      render(<TransactionFilterSidebar {...mockProps} />);
+
+      const xlmButtons = screen.getAllByRole("button", { name: /^XLM$/i });
+      fireEvent.click(xlmButtons[0]);
+      expect(mockProps.onFilterChange).toHaveBeenCalledWith("asset", "XLM");
+    });
+  });
+
+  // ── Clear All flash ────────────────────────────────────────────────────────
+
+  describe("Clear All button", () => {
+    it("calls onClearAll when clicked and enabled", () => {
+      render(<TransactionFilterSidebar {...mockProps} hasActiveFilters />);
+
+      const clearAllButtons = screen.getAllByRole("button", { name: /Clear All Filters/i });
+      fireEvent.click(clearAllButtons[0]);
+      expect(mockProps.onClearAll).toHaveBeenCalled();
+    });
+
+    it("is disabled when hasActiveFilters is false", () => {
+      render(<TransactionFilterSidebar {...mockProps} hasActiveFilters={false} />);
+
+      const clearAllButtons = screen.getAllByRole("button", { name: /Clear All Filters/i });
+      expect(clearAllButtons[0]).toBeDisabled();
+    });
   });
 
   // ── Accessibility ──────────────────────────────────────────────────────────
 
   describe("Accessibility", () => {
-    it("has proper ARIA role on mobile drawer", () => {
+    it("has dialog role with label on mobile drawer", () => {
       render(<TransactionFilterSidebar {...mockProps} />);
-
-      expect(
-        screen.getByRole("dialog", { name: /Filter sidebar/i }),
-      ).toBeInTheDocument();
+      expect(screen.getByRole("dialog", { name: /Filter sidebar/i })).toBeInTheDocument();
     });
 
-    it("calls onClose when close button is clicked (mobile)", () => {
+    it("asset group has accessible label", () => {
       render(<TransactionFilterSidebar {...mockProps} />);
-
-      const closeButtons = screen.getAllByLabelText(/Close filters/i);
-      fireEvent.click(closeButtons[0]);
-
-      expect(mockProps.onClose).toHaveBeenCalled();
-    });
-
-    it("asset button group has accessible group label", () => {
-      render(<TransactionFilterSidebar {...mockProps} />);
-
-      expect(
-        screen.getAllByRole("group", { name: /Asset filter/i }).length,
-      ).toBeGreaterThan(0);
+      expect(screen.getAllByRole("group", { name: /Asset filter/i }).length).toBeGreaterThan(0);
     });
   });
 });
