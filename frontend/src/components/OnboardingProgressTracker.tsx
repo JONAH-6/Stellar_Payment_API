@@ -152,7 +152,8 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
   orientation = "vertical",
   compact = false,
 }) => {
-  const t = useTranslations();`n  const progressSummaryId = useId();
+  const t = useTranslations();
+  const progressSummaryId = useId();
 
   // Respect user's OS-level "reduce motion" preference — #809
   const prefersReducedMotion = useReducedMotion();
@@ -253,7 +254,11 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
       aria-live="polite"
       aria-atomic="false"
     >
-      <p id={progressSummaryId} className="sr-only">`n        {progressSummary}`n      </p>`n`n      {/* Screen reader live announcement area — #811 */}
+      <p id={progressSummaryId} className="sr-only">
+        {progressSummary}
+      </p>
+
+      {/* Screen reader live announcement area — #811 */}
       <div
         className="sr-only"
         role="status"
@@ -301,7 +306,8 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
             aria-valuenow={progressPercentage}
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-label={t("onboarding.progressBar") || "Overall onboarding progress"}`n            aria-describedby={progressSummaryId}
+            aria-label={t("onboarding.progressBar") || "Overall onboarding progress"}
+            aria-describedby={progressSummaryId}
           >
             <motion.div
               className="h-full bg-gradient-to-r from-pluto-500 via-pluto-600 to-pluto-700"
@@ -336,7 +342,8 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
         <motion.ol
           className={`space-y-3 ${orientation === "horizontal" ? "flex gap-4 space-y-0" : ""}`}
           role="list"
-          aria-label={t("onboarding.stepsList") || "Onboarding steps"}`n          aria-orientation={orientation}
+          aria-label={t("onboarding.stepsList") || "Onboarding steps"}
+          aria-orientation={orientation}
           variants={containerVariants}
           initial="hidden"
           animate="visible"
@@ -365,6 +372,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
                 >
                   {/* Step indicator button */}
                   <button
+                    type="button"
                     onClick={() => handleStepClick(step.id)}
                     className={`relative flex-shrink-0 ${
                       compact ? "h-8 w-8" : "h-10 w-10"
