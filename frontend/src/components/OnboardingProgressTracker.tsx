@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useCallback, useMemo, useEffect, useReducer, useRef } from "react";
+import React, { useCallback, useMemo, useEffect, useId, useReducer, useRef } from "react";
 import { motion, AnimatePresence, useReducedMotion, type Variants } from "framer-motion";
 import { useTranslations } from "next-intl";
 import { onboardingReducer, createInitialOnboardingState } from "./onboarding-reducer";
@@ -153,6 +153,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
   compact = false,
 }) => {
   const t = useTranslations();
+  const progressSummaryId = useId();
 
   // Respect user's OS-level "reduce motion" preference — #809
   const prefersReducedMotion = useReducedMotion();
@@ -171,12 +172,20 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
     [steps]
   );
 
+  /** Number of completed steps for visible and assistive summaries */
+  const completedStepsCount = useMemo(
+    () => sortedSteps.filter((s) => s.completed).length,
+    [sortedSteps],
+  );
+
   /** Progress percentage based on completed steps */
   const progressPercentage = useMemo(() => {
     if (sortedSteps.length === 0) return 0;
-    const completedCount = sortedSteps.filter((s) => s.completed).length;
-    return Math.round((completedCount / sortedSteps.length) * 100);
-  }, [sortedSteps]);
+    return Math.round((completedStepsCount / sortedSteps.length) * 100);
+  }, [completedStepsCount, sortedSteps.length]);
+
+  /** Stable screen-reader summary for the tracker and progress bar */
+  const progressSummary = `${completedStepsCount} of ${sortedSteps.length} steps completed. ${progressPercentage}% complete.`;
 
   /** True when all required steps are completed */
   const isOnboardingComplete = useMemo(() => {
@@ -196,6 +205,8 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
    */
   const handleStepClick = useCallback(
     async (stepId: string) => {
+      if (state.isPending) return;
+
       const step = sortedSteps.find((s) => s.id === stepId);
       if (!step) return;
 
@@ -221,7 +232,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
         dispatch({ type: "SET_ANNOUNCEMENT", payload: rollbackAnnouncement });
       }
     },
-    [sortedSteps, effectiveCurrentStep, onStepChange, t]
+    [sortedSteps, effectiveCurrentStep, onStepChange, state.isPending, t]
   );
 
   /** Announce completion and fire callback — #811 */
@@ -253,6 +264,10 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
       aria-live="polite"
       aria-atomic="false"
     >
+      <p id={progressSummaryId} className="sr-only">
+        {progressSummary}
+      </p>
+
       {/* Screen reader live announcement area — #811 */}
       <div
         className="sr-only"
@@ -302,6 +317,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
             aria-valuemin={0}
             aria-valuemax={100}
             aria-label={t("onboarding.progressBar") || "Overall onboarding progress"}
+            aria-describedby={progressSummaryId}
           >
             <motion.div
               className="h-full bg-gradient-to-r from-pluto-500 via-pluto-600 to-pluto-700"
@@ -315,7 +331,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
 
           {/* Status text */}
           <p className="mt-2 text-xs text-[#6B6B6B]" aria-hidden="true">
-            {sortedSteps.filter((s) => s.completed).length} of{" "}
+            {completedStepsCount} of{" "}
             {sortedSteps.length} steps completed
             {isOnboardingComplete && (
               <span className="ml-2 inline-flex items-center gap-1 font-medium text-pluto-700">
@@ -337,6 +353,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
           className={`space-y-3 ${orientation === "horizontal" ? "flex gap-4 space-y-0" : ""}`}
           role="list"
           aria-label={t("onboarding.stepsList") || "Onboarding steps"}
+          aria-orientation={orientation}
           variants={containerVariants}
           initial="hidden"
           animate="visible"
@@ -344,6 +361,8 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
           <AnimatePresence mode="popLayout">
             {sortedSteps.map((step, index) => {
               const isCurrentStep = effectiveCurrentStep === step.id;
+              const isPendingStep = state.isPending && isCurrentStep;
+              const stepDescriptionId = `${progressSummaryId}-step-${index + 1}-description`;
 
               return (
                 <motion.li
@@ -365,6 +384,7 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
                 >
                   {/* Step indicator button */}
                   <button
+                    type="button"
                     onClick={() => handleStepClick(step.id)}
                     className={`relative flex-shrink-0 ${
                       compact ? "h-8 w-8" : "h-10 w-10"
@@ -385,8 +405,10 @@ export const OnboardingProgressTracker: React.FC<OnboardingProgressTrackerProps>
                     aria-setsize={sortedSteps.length}
                     aria-posinset={index + 1}
                     aria-roledescription="onboarding step"
-                    aria-busy={state.isPending && isCurrentStep}
-                    disabled={false}
+                    aria-describedby={stepDescriptionId}
+                    aria-busy={isPendingStep}
+                    aria-disabled={state.isPending ? "true" : undefined}
+                    disabled={state.isPending}
                   >
                     <AnimatePresence mode="wait">
                       {step.completed ? (
