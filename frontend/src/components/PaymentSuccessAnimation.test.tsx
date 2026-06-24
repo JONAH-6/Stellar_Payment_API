@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import "@testing-library/jest-dom/vitest";
+import React from "react";
 import confetti from "canvas-confetti";
 import { PaymentSuccessAnimation } from "./PaymentSuccessAnimation";
 
@@ -13,10 +14,46 @@ vi.mock("canvas-confetti", () => ({
   default: vi.fn(),
 }));
 
+// ── framer-motion mock ────────────────────────────────────────────────────────
+// Hoisted so useReducedMotion can be controlled per-test (#980)
+const { mockUseReducedMotion } = vi.hoisted(() => ({
+  mockUseReducedMotion: vi.fn(() => false as boolean | null),
+}));
+
+const MOTION_PROPS = [
+  "initial", "animate", "exit", "transition", "variants", "viewport",
+  "whileInView", "whileHover", "whileTap", "whileFocus", "whileDrag",
+  "layout", "layoutId", "custom", "drag", "dragConstraints",
+  "onAnimationStart", "onAnimationComplete", "onUpdate",
+];
+
+function mkMotion(tag: string) {
+  return React.forwardRef(function MotionStub({ children, ...props }: React.PropsWithChildren<Record<string, unknown>>, ref: React.Ref<unknown>) {
+    const domProps = { ...props };
+    MOTION_PROPS.forEach((k) => delete domProps[k]);
+    return React.createElement(tag, { ...domProps, ref }, children);
+  });
+}
+
+vi.mock("framer-motion", () => ({
+  motion: {
+    div: mkMotion("div"),
+    button: mkMotion("button"),
+    h1: mkMotion("h1"),
+    p: mkMotion("p"),
+    path: mkMotion("path"),
+  },
+  AnimatePresence: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
+  useReducedMotion: mockUseReducedMotion,
+}));
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 describe("PaymentSuccessAnimation", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.useRealTimers();
+    mockUseReducedMotion.mockReturnValue(false);
   });
 
   // ── Render / visibility ────────────────────────────────────────────────────
@@ -45,11 +82,10 @@ describe("PaymentSuccessAnimation", () => {
     expect(screen.getByText("0 XLM")).toBeInTheDocument();
   });
 
-  // ── Optimistic updates ─────────────────────────────────────────────────────
+  // ── Optimistic updates (#981) ──────────────────────────────────────────────
 
   it("shows optimistic badge when isOptimistic is true", () => {
     render(<PaymentSuccessAnimation show isOptimistic amount="50" asset="XLM" />);
-    // The optimistic live region + note text should be present
     expect(screen.getByText("payment.optimisticNote")).toBeInTheDocument();
   });
 
@@ -64,14 +100,82 @@ describe("PaymentSuccessAnimation", () => {
     expect(badge).toHaveAttribute("aria-live", "polite");
   });
 
+  it("continue button is disabled during optimistic dismiss", async () => {
+    let resolveOnComplete!: () => void;
+    const onComplete = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolveOnComplete = resolve; })
+    );
+    render(<PaymentSuccessAnimation show onComplete={onComplete} />);
+
+    await userEvent.click(screen.getByLabelText("common.continue"));
+
+    expect(screen.getByLabelText("common.continue")).toBeDisabled();
+    expect(screen.getByLabelText("common.continue")).toHaveAttribute("aria-busy", "true");
+
+    act(() => resolveOnComplete());
+  });
+
+  it("close button is disabled during optimistic dismiss", async () => {
+    let resolveOnComplete!: () => void;
+    const onComplete = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolveOnComplete = resolve; })
+    );
+    render(<PaymentSuccessAnimation show onComplete={onComplete} />);
+
+    await userEvent.click(screen.getByLabelText("common.close"));
+
+    expect(screen.getByLabelText("common.close")).toBeDisabled();
+    expect(screen.getByLabelText("common.close")).toHaveAttribute("aria-busy", "true");
+
+    act(() => resolveOnComplete());
+  });
+
+  it("shows spinner on continue button during dismiss", async () => {
+    let resolveOnComplete!: () => void;
+    const onComplete = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolveOnComplete = resolve; })
+    );
+    render(<PaymentSuccessAnimation show onComplete={onComplete} />);
+
+    await userEvent.click(screen.getByLabelText("common.continue"));
+
+    expect(screen.getByTestId("dismiss-spinner")).toBeInTheDocument();
+
+    act(() => resolveOnComplete());
+  });
+
+  it("rolls back dismiss state and re-enables buttons when onComplete throws", async () => {
+    const onComplete = vi.fn().mockRejectedValue(new Error("Network error"));
+    render(<PaymentSuccessAnimation show onComplete={onComplete} />);
+
+    await userEvent.click(screen.getByLabelText("common.continue"));
+
+    expect(screen.getByLabelText("common.continue")).not.toBeDisabled();
+    expect(screen.getByLabelText("common.continue")).not.toHaveAttribute("aria-busy", "true");
+  });
+
+  it("prevents double-dismiss while already dismissing", async () => {
+    let resolveOnComplete!: () => void;
+    const onComplete = vi.fn().mockImplementation(
+      () => new Promise<void>((resolve) => { resolveOnComplete = resolve; })
+    );
+    render(<PaymentSuccessAnimation show onComplete={onComplete} />);
+
+    await userEvent.click(screen.getByLabelText("common.continue"));
+
+    // onComplete should have been called exactly once; button is now disabled
+    expect(onComplete).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("common.continue")).toBeDisabled();
+
+    act(() => resolveOnComplete());
+  });
+
   // ── Confetti ───────────────────────────────────────────────────────────────
 
   it("triggers confetti once on show", () => {
     vi.useFakeTimers();
     const { rerender } = render(<PaymentSuccessAnimation show amount="1" asset="XLM" />);
-    // Initial render fires confetti
     expect(confetti).toHaveBeenCalledTimes(1);
-    // Re-render with same show=true should NOT fire again
     rerender(<PaymentSuccessAnimation show amount="1" asset="XLM" />);
     expect(confetti).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
@@ -82,7 +186,6 @@ describe("PaymentSuccessAnimation", () => {
     render(<PaymentSuccessAnimation show />);
     expect(confetti).toHaveBeenCalledTimes(1);
     act(() => { vi.advanceTimersByTime(200); });
-    // Flanking calls: +2 more
     expect(confetti).toHaveBeenCalledTimes(3);
     vi.useRealTimers();
   });
@@ -94,6 +197,15 @@ describe("PaymentSuccessAnimation", () => {
     rerender(<PaymentSuccessAnimation show={false} />);
     rerender(<PaymentSuccessAnimation show />);
     expect(confetti).toHaveBeenCalledTimes(2);
+    vi.useRealTimers();
+  });
+
+  it("skips confetti when prefersReducedMotion is true (#980)", () => {
+    mockUseReducedMotion.mockReturnValue(true);
+    vi.useFakeTimers();
+    render(<PaymentSuccessAnimation show />);
+    act(() => { vi.advanceTimersByTime(200); });
+    expect(confetti).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 
@@ -149,7 +261,7 @@ describe("PaymentSuccessAnimation", () => {
     expect(onComplete).not.toHaveBeenCalled();
   });
 
-  // ── Screen reader / accessibility ─────────────────────────────────────────
+  // ── Screen reader / accessibility (#980) ──────────────────────────────────
 
   it("has expected dialog ARIA semantics", () => {
     render(<PaymentSuccessAnimation show amount="20" asset="USDC" />);
@@ -166,6 +278,26 @@ describe("PaymentSuccessAnimation", () => {
     expect(status).toHaveAttribute("aria-live", "assertive");
     expect(status).toHaveAttribute("aria-atomic", "true");
     expect(status).toHaveTextContent("payment.successAnnounce");
+  });
+
+  it("renders dynamic announcement region with data-testid", () => {
+    render(<PaymentSuccessAnimation show />);
+    expect(screen.getByTestId("sr-announcement")).toBeInTheDocument();
+  });
+
+  it("announces network confirmation when isOptimistic changes from true to false", () => {
+    const { rerender } = render(<PaymentSuccessAnimation show isOptimistic />);
+    rerender(<PaymentSuccessAnimation show isOptimistic={false} />);
+    expect(screen.getByTestId("sr-announcement")).toHaveTextContent("payment.networkConfirmed");
+  });
+
+  it("announces error in live region when onComplete throws", async () => {
+    const onComplete = vi.fn().mockRejectedValue(new Error("Stellar network error"));
+    render(<PaymentSuccessAnimation show onComplete={onComplete} />);
+
+    await userEvent.click(screen.getByLabelText("common.continue"));
+
+    expect(screen.getByTestId("sr-announcement")).toHaveTextContent("Stellar network error");
   });
 
   it("close button has a descriptive accessible label", () => {
