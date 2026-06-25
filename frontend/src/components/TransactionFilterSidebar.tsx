@@ -153,6 +153,14 @@ export default function TransactionFilterSidebar({
   const uid = useId();
   const anyPending = searchSyncPending || isFilterPending;
 
+  const activeFilterCount = [
+    filters.search !== "",
+    filters.status !== "all",
+    filters.asset !== "all",
+    filters.dateFrom !== "",
+    filters.dateTo !== "",
+  ].filter(Boolean).length;
+
   const renderContent = (isMobile: boolean) => {
     const suffix = isMobile ? `-${uid}-mobile` : `-${uid}-desktop`;
 
@@ -165,7 +173,27 @@ export default function TransactionFilterSidebar({
         <div className="mb-8 flex items-center justify-between">
           <div className="flex items-center">
             <h2 className="text-xl font-bold text-[#0A0A0A]">Filters</h2>
+            {/* Optimistic active-filter count badge — updates before URL sync */}
+            {activeFilterCount > 0 && (
+              <span
+                className="ml-2 rounded-full bg-[var(--pluto-500)] px-2 py-0.5 text-[10px] font-bold text-white"
+                aria-hidden="true"
+              >
+                {activeFilterCount}
+              </span>
+            )}
             <PendingBadge visible={anyPending} />
+            {/* Screen-reader live region for filter count announcements */}
+            <span
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+              className="sr-only"
+            >
+              {activeFilterCount > 0
+                ? `${activeFilterCount} filter${activeFilterCount === 1 ? "" : "s"} active`
+                : ""}
+            </span>
           </div>
           {onClose && isMobile && (
             <button
@@ -393,7 +421,7 @@ export default function TransactionFilterSidebar({
                   >
                     {a === "all" ? "All" : a}
                     {isFilterPending && isActive && (
-                      <span className="ml-1.5 inline-block">
+                      <span className="ml-1.5 inline-block" aria-hidden="true">
                         <SyncSpinner />
                       </span>
                     )}
@@ -495,6 +523,11 @@ export default function TransactionFilterSidebar({
             onClick={onClearAll}
             disabled={!hasActiveFilters}
             whileTap={hasActiveFilters ? { scale: 0.97 } : undefined}
+            aria-label={
+              activeFilterCount > 0
+                ? `Clear all ${activeFilterCount} active filter${activeFilterCount === 1 ? "" : "s"}`
+                : "Clear all filters"
+            }
             className={[
               "w-full rounded-xl py-3 text-[10px] font-bold uppercase tracking-widest transition-all duration-200",
               "bg-[#0A0A0A] text-white hover:bg-[#2A2A2A] active:scale-[0.98]",
@@ -518,7 +551,11 @@ export default function TransactionFilterSidebar({
   return (
     <>
       {/* Desktop: persistent sticky panel */}
-      <div className="hidden lg:block w-[320px] h-fit sticky top-24">
+      <div
+        className="hidden lg:block w-[320px] h-fit sticky top-24"
+        role="complementary"
+        aria-label="Transaction filters"
+      >
         {renderContent(false)}
       </div>
 

@@ -702,4 +702,142 @@ describe("TransactionFilterSidebar", () => {
       expect(btn).toBeDisabled();
     });
   });
+
+  // ── 7. Screen reader & optimistic updates (#939, #940, #941) ─────────────
+
+  describe("7 · Screen reader & optimistic updates (#939 #940 #941)", () => {
+    // #940 — desktop landmark role
+    it("desktop panel has role='complementary' with accessible label", () => {
+      const { container } = render(<TransactionFilterSidebar {...buildProps()} />);
+      const panel = getDesktopPanel(container);
+      expect(panel).toHaveAttribute("role", "complementary");
+      expect(panel).toHaveAttribute("aria-label", "Transaction filters");
+    });
+
+    // #940 — SyncSpinner inside asset buttons must be decorative so it doesn't
+    //         corrupt the button's accessible name with "Syncing…"
+    it("SyncSpinner wrapper inside active asset button has aria-hidden='true'", () => {
+      const { container } = render(
+        <TransactionFilterSidebar
+          {...buildProps({ filters: { ...DEFAULT_FILTERS, asset: "USDC" }, isFilterPending: true })}
+        />,
+      );
+      const panel = getDesktopPanel(container);
+      const usdc = within(panel).getByRole("button", { name: /USDC/i });
+      // The span wrapping SyncSpinner must hide spinner text from the button label.
+      const hiddenSpan = usdc.querySelector("span[aria-hidden='true']");
+      expect(hiddenSpan).toBeInTheDocument();
+    });
+
+    // #941 — optimistic active-filter count badge
+    it("shows no count badge when no filters are active", () => {
+      const { container } = render(<TransactionFilterSidebar {...buildProps()} />);
+      const panel = getDesktopPanel(container);
+      // Badge is the aria-hidden span next to the heading.
+      const badge = within(panel).queryByText(/^\d+$/);
+      expect(badge).not.toBeInTheDocument();
+    });
+
+    it("shows count badge of 1 when only search is active", () => {
+      const { container } = render(
+        <TransactionFilterSidebar
+          {...buildProps({ filters: { ...DEFAULT_FILTERS, search: "tx-abc" }, hasActiveFilters: true })}
+        />,
+      );
+      const panel = getDesktopPanel(container);
+      // aria-hidden badge with the count number
+      expect(within(panel).getByText("1")).toBeInTheDocument();
+    });
+
+    it("shows correct count when multiple filters are active", () => {
+      const { container } = render(
+        <TransactionFilterSidebar
+          {...buildProps({
+            filters: {
+              search: "tx-999",
+              status: "confirmed",
+              asset: "USDC",
+              dateFrom: "2024-01-01",
+              dateTo: "2024-12-31",
+            },
+            hasActiveFilters: true,
+          })}
+        />,
+      );
+      const panel = getDesktopPanel(container);
+      expect(within(panel).getByText("5")).toBeInTheDocument();
+    });
+
+    // #940 — live region for screen-reader filter count announcements
+    it("renders a polite live region for active filter count", () => {
+      const { container } = render(<TransactionFilterSidebar {...buildProps()} />);
+      const panel = getDesktopPanel(container);
+      const live = within(panel).getByRole("status");
+      expect(live).toBeInTheDocument();
+      expect(live).toHaveAttribute("aria-live", "polite");
+    });
+
+    it("live region is empty when no filters are active", () => {
+      const { container } = render(<TransactionFilterSidebar {...buildProps()} />);
+      const panel = getDesktopPanel(container);
+      const live = within(panel).getByRole("status");
+      expect(live.textContent).toBe("");
+    });
+
+    it("live region announces singular count text when one filter is active", () => {
+      const { container } = render(
+        <TransactionFilterSidebar
+          {...buildProps({ filters: { ...DEFAULT_FILTERS, search: "q" }, hasActiveFilters: true })}
+        />,
+      );
+      const panel = getDesktopPanel(container);
+      const live = within(panel).getByRole("status");
+      expect(live).toHaveTextContent("1 filter active");
+    });
+
+    it("live region announces plural count text when multiple filters are active", () => {
+      const { container } = render(
+        <TransactionFilterSidebar
+          {...buildProps({
+            filters: { ...DEFAULT_FILTERS, search: "q", status: "confirmed" },
+            hasActiveFilters: true,
+          })}
+        />,
+      );
+      const panel = getDesktopPanel(container);
+      const live = within(panel).getByRole("status");
+      expect(live).toHaveTextContent("2 filters active");
+    });
+
+    // #941 — Clear All accessible label reflects the active filter count
+    it("Clear All button aria-label includes the active count", () => {
+      const { container } = render(
+        <TransactionFilterSidebar
+          {...buildProps({
+            filters: { ...DEFAULT_FILTERS, status: "confirmed", asset: "XLM" },
+            hasActiveFilters: true,
+          })}
+        />,
+      );
+      const panel = getDesktopPanel(container);
+      const btn = within(panel).getByRole("button", { name: /clear all 2 active filters/i });
+      expect(btn).toBeInTheDocument();
+    });
+
+    it("Clear All button aria-label is generic when no filters are active", () => {
+      const { container } = render(<TransactionFilterSidebar {...buildProps()} />);
+      const panel = getDesktopPanel(container);
+      const btn = within(panel).getByRole("button", { name: /clear all filters/i });
+      expect(btn).toBeInTheDocument();
+      expect(btn).toHaveAttribute("aria-label", "Clear all filters");
+    });
+
+    // #940 — mobile dialog still has its landmark attributes
+    it("mobile dialog retains role='dialog' and aria-modal when open", () => {
+      render(<TransactionFilterSidebar {...buildProps({ isOpen: true })} />);
+      const dialog = screen.getByRole("dialog");
+      expect(dialog).toHaveAttribute("aria-modal", "true");
+      expect(dialog).toHaveAttribute("aria-label", "Filter sidebar");
+    });
+  });
 });
