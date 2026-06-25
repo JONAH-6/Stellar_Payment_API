@@ -1,9 +1,11 @@
-import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useMemo, useCallback, useRef, useId } from 'react';
 import './PortfolioChart.css';
 
 // Note: This is a simplified chart component
 // In a real implementation, you might use Recharts, Chart.js, or D3
 // For testing purposes, we'll create a basic SVG-based chart
+
+const RANGE_OPTIONS = ['1M', '3M', '6M', '1Y'];
 
 const PortfolioChart = ({
   data = [],
@@ -26,19 +28,34 @@ const PortfolioChart = ({
   const [activePoint, setActivePoint] = useState(null);
   const [selectedRange, setSelectedRange] = useState('1Y');
   const [isMobile, setIsMobile] = useState(false);
+  // Optimistic update state: true immediately when range changes, cleared when parent sends new data
+  const [isPendingRange, setIsPendingRange] = useState(false);
+
+  const announcementsRef = useRef(null);
+  const isFirstRender = useRef(true);
+  const chartId = useId();
 
   // Check for mobile viewport
   useEffect(() => {
     if (!responsive) return;
-    
+
     const checkMobile = () => {
       setIsMobile(window.innerWidth < 768);
     };
-    
+
     checkMobile();
     window.addEventListener('resize', checkMobile);
     return () => window.removeEventListener('resize', checkMobile);
   }, [responsive]);
+
+  // Reset pending state when parent delivers new data in response to range change
+  useEffect(() => {
+    if (isFirstRender.current) {
+      isFirstRender.current = false;
+      return;
+    }
+    setIsPendingRange(false);
+  }, [data]);
 
   // Format currency values
   const formatCurrency = useCallback((value) => {
@@ -66,47 +83,57 @@ const PortfolioChart = ({
   // Calculate chart points for SVG rendering
   const chartPoints = useMemo(() => {
     if (!data || data.length === 0) return [];
-    
-    const width = isMobile ? 300 : 600;
+
+    const w = isMobile ? 300 : 600;
     const height_val = isMobile ? 200 : 300;
     const padding = 40;
-    const chartWidth = width - 2 * padding;
+    const chartWidth = w - 2 * padding;
     const chartHeight = height_val - 2 * padding;
-    
+
     return data.map((point, index) => {
       const x = padding + (index / (data.length - 1)) * chartWidth;
-      const y = padding + chartHeight - 
+      const y = padding + chartHeight -
         ((point.value - minValue) / (maxValue - minValue)) * chartHeight;
       return { x, y, value: point.value, date: point.date, original: point };
     });
   }, [data, minValue, maxValue, isMobile]);
 
+  // Concise text summary of chart data for screen readers
+  const dataSummary = useMemo(() => {
+    if (!data || data.length === 0) return '';
+    const values = data.map(d => d.value);
+    const first = data[0];
+    const last = data[data.length - 1];
+    return `${title}. Range: ${first.date} to ${last.date}. Min: ${formatCurrency(Math.min(...values))}, Max: ${formatCurrency(Math.max(...values))}, Latest: ${formatCurrency(last.value)}.`;
+  }, [data, title, formatCurrency]);
+
   // Handle keyboard navigation
   const handleKeyDown = useCallback((e) => {
     if (!keyboardNavigation || !interactive) return;
-    
-    if (e.key === 'ArrowRight' && activePoint !== null && activePoint < chartPoints.length - 1) {
-      setActivePoint(activePoint + 1);
-      if (announcementRegion) {
-        const announcement = `Data point ${activePoint + 2}: ${formatCurrency(chartPoints[activePoint + 1].value)}`;
-        const liveRegion = document.getElementById('sr-announcements');
-        if (liveRegion) liveRegion.textContent = announcement;
-      }
+
+    let next = activePoint;
+    if (e.key === 'ArrowRight') {
+      if (activePoint === null && chartPoints.length > 0) next = 0;
+      else if (activePoint !== null && activePoint < chartPoints.length - 1) next = activePoint + 1;
     } else if (e.key === 'ArrowLeft' && activePoint !== null && activePoint > 0) {
-      setActivePoint(activePoint - 1);
-      if (announcementRegion) {
-        const announcement = `Data point ${activePoint}: ${formatCurrency(chartPoints[activePoint - 1].value)}`;
-        const liveRegion = document.getElementById('sr-announcements');
-        if (liveRegion) liveRegion.textContent = announcement;
+      next = activePoint - 1;
+    } else {
+      return;
+    }
+
+    if (next !== activePoint) {
+      setActivePoint(next);
+      if (announcementRegion && announcementsRef.current && next !== null) {
+        announcementsRef.current.textContent =
+          `Data point ${next + 1} of ${chartPoints.length}: ${chartPoints[next].date}, ${formatCurrency(chartPoints[next].value)}`;
       }
-    } else if (e.key === 'ArrowRight' && activePoint === null && chartPoints.length > 0) {
-      setActivePoint(0);
     }
   }, [keyboardNavigation, interactive, activePoint, chartPoints, formatCurrency, announcementRegion]);
 
-  // Handle range selection
+  // Handle range selection — set optimistic pending state immediately
   const handleRangeChange = useCallback((range) => {
     setSelectedRange(range);
+    setIsPendingRange(true);
     if (onRangeChange) {
       onRangeChange(range);
     }
@@ -141,58 +168,72 @@ const PortfolioChart = ({
   }
 
   return (
-    <div 
+    <div
       className={`portfolio-chart ${isMobile ? 'mobile-view' : 'desktop-view'}`}
       data-testid="portfolio-chart"
       role="figure"
       aria-label={ariaLabel}
+      aria-describedby={`${chartId}-summary`}
     >
+      {/* Visually hidden data summary for screen readers */}
+      <p id={`${chartId}-summary`} className="sr-only">{dataSummary}</p>
+
       {title && <h3 className="chart-title">{title}</h3>}
-      
+
       {/* Date Range Picker */}
       {dateRangePicker && (
-        <div className="range-picker">
-          <button 
-            onClick={() => handleRangeChange('1M')}
-            className={selectedRange === '1M' ? 'active' : ''}
-          >
-            1M
-          </button>
-          <button 
-            onClick={() => handleRangeChange('3M')}
-            className={selectedRange === '3M' ? 'active' : ''}
-          >
-            3M
-          </button>
-          <button 
-            onClick={() => handleRangeChange('6M')}
-            className={selectedRange === '6M' ? 'active' : ''}
-          >
-            6M
-          </button>
-          <button 
-            onClick={() => handleRangeChange('1Y')}
-            className={selectedRange === '1Y' ? 'active' : ''}
-          >
-            1Y
-          </button>
+        <div className="range-picker" role="group" aria-label="Select date range">
+          {RANGE_OPTIONS.map((range) => (
+            <button
+              key={range}
+              onClick={() => handleRangeChange(range)}
+              className={selectedRange === range ? 'active' : ''}
+              aria-pressed={selectedRange === range}
+            >
+              {range}
+            </button>
+          ))}
         </div>
       )}
-      
-      {/* Chart Container */}
-      <div 
+
+      {/* Chart Container — keyboard-focusable for arrow-key navigation */}
+      <div
         className="chart-container"
         data-testid="chart-container"
-        style={{ height: isMobile ? '300px' : `${height}px` }}
+        style={{
+          height: isMobile ? '300px' : `${height}px`,
+          opacity: isPendingRange ? 0.6 : 1,
+          transition: 'opacity 0.2s ease',
+        }}
+        onKeyDown={handleKeyDown}
+        tabIndex={keyboardNavigation ? 0 : -1}
+        aria-label={keyboardNavigation ? 'Use left and right arrow keys to navigate data points' : undefined}
+        aria-busy={isPendingRange}
       >
-        <svg 
-          width={width} 
+        {/* Pending overlay shown while parent fetches new range data */}
+        {isPendingRange && (
+          <div
+            aria-hidden="true"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              pointerEvents: 'none',
+              zIndex: 1,
+            }}
+          >
+            <div className="loading-spinner" style={{ width: 24, height: 24 }} />
+          </div>
+        )}
+
+        {/* SVG is aria-hidden; the parent figure + summary provide the accessible label */}
+        <svg
+          width={width}
           height={isMobile ? 300 : height}
           viewBox={`0 0 ${isMobile ? 400 : 800} ${isMobile ? 300 : height}`}
-          onKeyDown={handleKeyDown}
-          tabIndex={keyboardNavigation ? 0 : -1}
-          role="img"
-          aria-label={ariaLabel}
+          aria-hidden="true"
         >
           {/* Grid lines */}
           <g className="grid-lines">
@@ -208,7 +249,7 @@ const PortfolioChart = ({
               />
             ))}
           </g>
-          
+
           {/* Chart line */}
           <polyline
             data-testid="chart-line"
@@ -217,7 +258,7 @@ const PortfolioChart = ({
             stroke="#4CAF50"
             strokeWidth="3"
           />
-          
+
           {/* Data points */}
           {chartPoints.map((point, index) => (
             <circle
@@ -232,7 +273,7 @@ const PortfolioChart = ({
               onClick={() => onDataPointClick && onDataPointClick(point.original)}
             />
           ))}
-          
+
           {/* Labels */}
           <g className="labels">
             {chartPoints.map((point, index) => (
@@ -249,7 +290,7 @@ const PortfolioChart = ({
           </g>
         </svg>
       </div>
-      
+
       {/* Legend */}
       {showLegend && (
         <div className="chart-legend" data-testid="chart-legend">
@@ -259,23 +300,24 @@ const PortfolioChart = ({
           </div>
         </div>
       )}
-      
-      {/* Screen reader announcements */}
+
+      {/* Screen reader announcements — uses ref to avoid global ID conflicts */}
       {announcementRegion && (
-        <div 
-          id="sr-announcements"
+        <div
+          ref={announcementsRef}
           data-testid="sr-announcements"
           className="sr-only"
           aria-live="polite"
           aria-atomic="true"
-        ></div>
+        />
       )}
-      
+
       {/* Tooltip for active point */}
       {activePoint !== null && chartPoints[activePoint] && interactive && (
-        <div 
+        <div
           className="chart-tooltip"
           data-testid="chart-tooltip"
+          role="tooltip"
           style={{
             position: 'absolute',
             left: `${chartPoints[activePoint].x}px`,
